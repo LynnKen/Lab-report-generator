@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//tmp/inspect/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import docx; print\\('ok', docx.__version__ if hasattr\\(docx,'__version__'\\) else ''\\)\")",
+      "Bash(python3 -c \"import PIL; print\\('pillow ok'\\)\")",
+      "Bash(pip show *)"
+    ]
+  }
+}
