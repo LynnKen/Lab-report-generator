@@ -27,7 +27,7 @@ REFERENCE_REPORTS_DIR = TEMPLATES_DIR / "reference_reports"
 # --- Prompt / style guide ----------------------------------------------
 
 PROMPTS_DIR = BASE_DIR / "prompts"
-REPORT_PROMPT_PATH = PROMPTS_DIR / "report_prompt.txt"
+CAPTION_PROMPT_PATH = PROMPTS_DIR / "caption_prompt.txt"
 
 DATA_DIR = BASE_DIR / "data"
 STYLE_GUIDE_PATH = DATA_DIR / "style_guide.md"
@@ -68,8 +68,31 @@ PHOTO_MAX_DIMENSION_PX = int(os.getenv("PHOTO_MAX_DIMENSION_PX", "1600"))
 PHOTO_PREVIEW_MAX_DIMENSION_PX = int(os.getenv("PHOTO_PREVIEW_MAX_DIMENSION_PX", "480"))
 PHOTO_JPEG_QUALITY = int(os.getenv("PHOTO_JPEG_QUALITY", "88"))
 PHOTO_GRID_COLUMNS = int(os.getenv("PHOTO_GRID_COLUMNS", "2"))
+# Photos per photo-appendix page. python-docx/docxtpl cannot know Word's real
+# pagination ahead of time, so appendix pages are grouped deterministically
+# at this fixed capacity (forced page breaks between groups) rather than
+# left to natural reflow - this is what lets each page's photos stay glued
+# to their own caption block. Kept conservative (2 rows of 2) so a full
+# group + its caption text reliably fits on one page.
+PHOTOS_PER_APPENDIX_PAGE = int(os.getenv("PHOTOS_PER_APPENDIX_PAGE", "4"))
+
+# Photo-appendix layout. Images are scaled down slightly and given a real
+# gutter so the page reads as a set of distinct photos rather than one dense
+# block; the number beside each photo is enlarged so it stays legible.
+PHOTO_IMAGE_SCALE = float(os.getenv("PHOTO_IMAGE_SCALE", "0.88"))
+PHOTO_GUTTER_MM = float(os.getenv("PHOTO_GUTTER_MM", "8"))
+PHOTO_NUMBER_FONT_PT = float(os.getenv("PHOTO_NUMBER_FONT_PT", "14"))
 ALLOWED_PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 MAX_PHOTO_FILE_SIZE_MB = int(os.getenv("MAX_PHOTO_FILE_SIZE_MB", "25"))
+
+# --- Page-count automation (MS Word COM, see word_page_counter.py) ------
+
+PAGE_COUNT_AUTOMATION_ENABLED = os.getenv("PAGE_COUNT_AUTOMATION_ENABLED", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+)
+PAGE_COUNT_MAX_ATTEMPTS = int(os.getenv("PAGE_COUNT_MAX_ATTEMPTS", "3"))
 
 # --- Misc -----------------------------------------------------------------
 
@@ -85,10 +108,7 @@ def sanitize_filename_component(text: str) -> str:
     return cleaned or "ללא_שם"
 
 
-def build_report_filename(report_number: str, report_date: str, client_name: str) -> str:
-    parts = [
-        sanitize_filename_component(report_number),
-        sanitize_filename_component(report_date),
-        sanitize_filename_component(client_name),
-    ]
-    return "_".join(parts) + ".docx"
+def build_report_filename(report_number: str) -> str:
+    """Matches the lab's real naming convention observed in its reference
+    reports (e.g. "C2501508pub.docx"), not an invented format."""
+    return f"{sanitize_filename_component(report_number)}pub.docx"

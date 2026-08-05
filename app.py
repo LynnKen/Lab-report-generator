@@ -1,15 +1,16 @@
 """Lab Report Generator - main Flet application (Hebrew, RTL).
 
-Collects a short set of facts and photos from the user, asks the AI service
-to write them up in the lab's Hebrew style, lets the user review/edit that
-text and the photos, then builds the final .docx via report_builder.py.
+Collects report metadata, manually-authored report text (כללי/ממצאים/דיון
+ומסקנות), and photos from the user, then builds the final .docx via
+report_builder.py. The only AI involvement anywhere in this app is
+per-photo caption suggestions (ai_service.py) — report text itself is
+always written directly by the user, never AI-generated.
 """
 
 from __future__ import annotations
 
 import asyncio
 import datetime
-import math
 import os
 import traceback
 from pathlib import Path
@@ -24,6 +25,12 @@ import report_builder
 FIELD_WIDTH = 240
 WIDE_FIELD_WIDTH = 540
 
+# Crop dialog geometry (on-screen pixels).
+CROP_CANVAS_MAX_PX = 420  # longest side of the photo inside the crop canvas
+CROP_PREVIEW_PX = 220
+HANDLE_PX = 14
+MIN_CROP_PX = 24  # smallest frame the user can drag down to
+
 
 def _today_str() -> str:
     return datetime.date.today().strftime("%d.%m.%y")
@@ -33,8 +40,44 @@ def _split_paragraphs(text: str) -> list[str]:
     return [line.strip() for line in (text or "").split("\n") if line.strip()]
 
 
-def _join_paragraphs(paragraphs: list[str]) -> str:
-    return "\n".join(paragraphs)
+class StatusArea:
+    """The single authoritative status/warning area.
+
+    It is rendered next to the generate button at the END of the form, so
+    validation errors, progress and completion messages all appear exactly
+    where the user is looking when they submit - never at the top of a long
+    scrolled page. Each state gets its own colour + icon so warnings are
+    clearly distinct from hard errors and from success.
+    """
+
+    STYLES = {
+        "info": (ft.Colors.BLUE_700, ft.Icons.INFO_OUTLINE),
+        "progress": (ft.Colors.BLUE_700, ft.Icons.HOURGLASS_TOP),
+        "success": (ft.Colors.GREEN_800, ft.Icons.CHECK_CIRCLE_OUTLINE),
+        "warning": (ft.Colors.ORANGE_800, ft.Icons.WARNING_AMBER_ROUNDED),
+        "error": (ft.Colors.RED_700, ft.Icons.ERROR_OUTLINE),
+    }
+
+    def __init__(self) -> None:
+        self.icon = ft.Icon(None, size=18, visible=False)
+        self.text = ft.Text("", size=14, weight=ft.FontWeight.BOLD, selectable=True)
+        self.spinner = ft.ProgressRing(width=16, height=16, stroke_width=2, visible=False)
+        self.control = ft.Row(
+            controls=[self.spinner, self.icon, self.text],
+            spacing=8,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+    def set(self, message: str, kind: str = "info") -> None:
+        """kind: info | progress | success | warning | error."""
+        color, icon = self.STYLES.get(kind, self.STYLES["info"])
+        self.text.value = message
+        self.text.color = color
+        self.icon.icon = icon
+        self.icon.color = color
+        # The spinner replaces the icon while work is in flight.
+        self.icon.visible = bool(message) and kind != "progress"
+        self.spinner.visible = kind == "progress"
 
 
 async def main(page: ft.Page):
@@ -48,11 +91,10 @@ async def main(page: ft.Page):
     photos: list[photo_service.PhotoAsset] = []
 
     # ---------------------------------------------------------------- status
-    status_text = ft.Text("", size=14, weight=ft.FontWeight.BOLD)
+    status = StatusArea()
 
-    def set_status(message: str, error: bool = False) -> None:
-        status_text.value = message
-        status_text.color = ft.Colors.RED_700 if error else ft.Colors.GREEN_800
+    def set_status(message: str, kind: str = "info") -> None:
+        status.set(message, kind)
         page.update()
 
     # ---------------------------------------------------------- report fields
@@ -76,44 +118,15 @@ async def main(page: ft.Page):
     inspection_nature_field = ft.TextField(label="מהות הבדיקה (אופציונלי)", width=FIELD_WIDTH)
     license_number_field = ft.TextField(label="מספר רישוי (אופציונלי)", width=FIELD_WIDTH)
 
-    findings_notes_field = ft.TextField(
-        label="ממצאים עיקריים - במילים שלך, בקצרה",
-        multiline=True,
-        min_lines=3,
-        max_lines=8,
-        width=WIDE_FIELD_WIDTH,
-    )
-    actions_taken_field = ft.TextField(
-        label="פעולות שבוצעו", multiline=True, min_lines=2, max_lines=6, width=WIDE_FIELD_WIDTH
-    )
-    comments_field = ft.TextField(
-        label="הערות נוספות (אופציונלי)", multiline=True, min_lines=2, max_lines=5, width=WIDE_FIELD_WIDTH
-    )
-
-    page_count_field = ft.TextField(label="מספר עמודים משוער", width=FIELD_WIDTH)
-    photo_page_count_field = ft.TextField(label="מתוכם, עמודי תמונות", width=FIELD_WIDTH)
-
-    # -------------------------------------------------------------- review UI
+    # ---------------------------------------------------- report text (manual)
     general_review_field = ft.TextField(
-        label="כללי - ניתן לערוך",
-        multiline=True,
-        min_lines=3,
-        max_lines=10,
-        width=WIDE_FIELD_WIDTH,
+        label="כללי", multiline=True, min_lines=3, max_lines=10, width=WIDE_FIELD_WIDTH
     )
     findings_review_field = ft.TextField(
-        label="ממצאים - ניתן לערוך",
-        multiline=True,
-        min_lines=4,
-        max_lines=14,
-        width=WIDE_FIELD_WIDTH,
+        label="ממצאים", multiline=True, min_lines=4, max_lines=14, width=WIDE_FIELD_WIDTH
     )
     discussion_review_field = ft.TextField(
-        label="דיון ומסקנות - ניתן לערוך",
-        multiline=True,
-        min_lines=3,
-        max_lines=10,
-        width=WIDE_FIELD_WIDTH,
+        label="דיון ומסקנות", multiline=True, min_lines=3, max_lines=10, width=WIDE_FIELD_WIDTH
     )
 
     # ------------------------------------------------------------- photos UI
@@ -125,11 +138,6 @@ async def main(page: ft.Page):
                 return idx
         return -1
 
-    def refresh_photo_page_count_hint() -> None:
-        if not photo_page_count_field.value:
-            estimate = max(1, math.ceil(len(photos) / (config.PHOTO_GRID_COLUMNS * 2))) if photos else 0
-            photo_page_count_field.value = str(estimate)
-
     def remove_photo(photo_id: str) -> None:
         idx = _photo_row_index(photo_id)
         if idx < 0:
@@ -139,18 +147,40 @@ async def main(page: ft.Page):
             asset.order_index = i
         rebuild_photo_rows()
 
-    def approve_crop(photo_id: str) -> None:
+    async def maybe_generate_caption(asset: photo_service.PhotoAsset) -> None:
+        """Auto-generates/regenerates a caption from the current final image,
+        unless the user has manually edited the caption for this photo."""
+        if asset.caption_is_manual:
+            return
+        try:
+            service = await asyncio.to_thread(ai_service.build_ai_service)
+            caption = await asyncio.to_thread(service.generate_photo_caption, asset.final_path)
+        except ai_service.AIServiceError:
+            return  # best-effort only - never blocks the workflow
+        except Exception:
+            traceback.print_exc()
+            return
+        if not asset.caption_is_manual:  # user may have started typing meanwhile
+            asset.caption = caption
+
+    async def approve_crop(photo_id: str) -> None:
         idx = _photo_row_index(photo_id)
         if idx < 0:
             return
-        photo_service.apply_crop(photos[idx], photos[idx].suggested_crop_box)
+        asset = photos[idx]
+        photo_service.apply_crop(asset, asset.suggested_crop_box)
+        rebuild_photo_rows()
+        await maybe_generate_caption(asset)
         rebuild_photo_rows()
 
-    def keep_original(photo_id: str) -> None:
+    async def keep_original(photo_id: str) -> None:
         idx = _photo_row_index(photo_id)
         if idx < 0:
             return
-        photo_service.discard_crop(photos[idx])
+        asset = photos[idx]
+        photo_service.discard_crop(asset)
+        rebuild_photo_rows()
+        await maybe_generate_caption(asset)
         rebuild_photo_rows()
 
     def make_caption_handler(photo_id: str):
@@ -158,8 +188,219 @@ async def main(page: ft.Page):
             idx = _photo_row_index(photo_id)
             if idx >= 0:
                 photos[idx].caption = e.control.value
+                photos[idx].caption_is_manual = True
 
         return _handler
+
+    async def open_crop_dialog(photo_id: str) -> None:
+        """Word-like visual crop: the full photo with a draggable, resizable
+        frame over it, everything outside the frame dimmed, and a live preview
+        of exactly what will end up in the report.
+
+        The frame is always drawn over the UNCROPPED original, and the crop is
+        only ever applied by re-cutting from that original, so cropping stays
+        non-destructive and "reset" genuinely restores the whole image."""
+        idx = _photo_row_index(photo_id)
+        if idx < 0:
+            return
+        asset = photos[idx]
+
+        disp_w, disp_h = photo_service.display_size_for(
+            asset.width, asset.height, CROP_CANVAS_MAX_PX
+        )
+        base_bytes = await asyncio.to_thread(
+            photo_service.render_uncropped_preview, asset, CROP_CANVAS_MAX_PX
+        )
+
+        # Crop rect in *display* pixels: [left, top, right, bottom]. Seeded
+        # from any crop the user already applied, otherwise the whole frame.
+        if asset.user_crop_box is not None:
+            sx, sy = disp_w / asset.width, disp_h / asset.height
+            left, top, right, bottom = asset.user_crop_box
+            rect = [left * sx, top * sy, right * sx, bottom * sy]
+        else:
+            rect = [0.0, 0.0, float(disp_w), float(disp_h)]
+
+        def clamped_rect() -> list[float]:
+            left = max(0.0, min(rect[0], disp_w - MIN_CROP_PX))
+            top = max(0.0, min(rect[1], disp_h - MIN_CROP_PX))
+            right = max(left + MIN_CROP_PX, min(rect[2], float(disp_w)))
+            bottom = max(top + MIN_CROP_PX, min(rect[3], float(disp_h)))
+            return [left, top, right, bottom]
+
+        def current_box() -> photo_service.BoundingBox:
+            left, top, right, bottom = clamped_rect()
+            return photo_service.display_box_to_original(
+                (round(left), round(top), round(right), round(bottom)),
+                disp_w,
+                disp_h,
+                asset.width,
+                asset.height,
+            )
+
+        base_image = ft.Image(src=base_bytes, width=disp_w, height=disp_h, fit=ft.BoxFit.FILL)
+        preview_image = ft.Image(
+            src=base_bytes, width=CROP_PREVIEW_PX, height=CROP_PREVIEW_PX, fit=ft.BoxFit.CONTAIN
+        )
+        size_label = ft.Text("", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+
+        def dim(**kwargs) -> ft.Container:
+            return ft.Container(bgcolor=ft.Colors.with_opacity(0.55, ft.Colors.BLACK), **kwargs)
+
+        shade_top, shade_bottom = dim(), dim()
+        shade_left, shade_right = dim(), dim()
+
+        frame = ft.Container(
+            border=ft.Border.all(2, ft.Colors.WHITE),
+            bgcolor=ft.Colors.TRANSPARENT,
+        )
+
+        def make_handle(name: str, cursor) -> ft.GestureDetector:
+            return ft.GestureDetector(
+                mouse_cursor=cursor,
+                on_pan_update=lambda e, n=name: resize_by(n, e),
+                on_pan_end=lambda e: page.run_task(refresh_preview),
+                content=ft.Container(
+                    width=HANDLE_PX,
+                    height=HANDLE_PX,
+                    bgcolor=ft.Colors.WHITE,
+                    border=ft.Border.all(1, ft.Colors.BLACK54),
+                    border_radius=2,
+                ),
+            )
+
+        handle_specs = [
+            ("nw", ft.MouseCursor.RESIZE_UP_LEFT), ("n", ft.MouseCursor.RESIZE_UP),
+            ("ne", ft.MouseCursor.RESIZE_UP_RIGHT), ("w", ft.MouseCursor.RESIZE_LEFT),
+            ("e", ft.MouseCursor.RESIZE_RIGHT), ("sw", ft.MouseCursor.RESIZE_DOWN_LEFT),
+            ("s", ft.MouseCursor.RESIZE_DOWN), ("se", ft.MouseCursor.RESIZE_DOWN_RIGHT),
+        ]
+        handles = {name: make_handle(name, cursor) for name, cursor in handle_specs}
+
+        move_detector = ft.GestureDetector(
+            mouse_cursor=ft.MouseCursor.MOVE,
+            on_pan_update=lambda e: move_by(e),
+            on_pan_end=lambda e: page.run_task(refresh_preview),
+            content=ft.Container(bgcolor=ft.Colors.TRANSPARENT),
+        )
+
+        def layout() -> None:
+            left, top, right, bottom = clamped_rect()
+            rect[:] = [left, top, right, bottom]
+            width, height = right - left, bottom - top
+
+            shade_top.left, shade_top.top = 0, 0
+            shade_top.width, shade_top.height = disp_w, top
+            shade_bottom.left, shade_bottom.top = 0, bottom
+            shade_bottom.width, shade_bottom.height = disp_w, disp_h - bottom
+            shade_left.left, shade_left.top = 0, top
+            shade_left.width, shade_left.height = left, height
+            shade_right.left, shade_right.top = right, top
+            shade_right.width, shade_right.height = disp_w - right, height
+
+            for box in (frame, move_detector):
+                box.left, box.top, box.width, box.height = left, top, width, height
+
+            half = HANDLE_PX / 2
+            positions = {
+                "nw": (left - half, top - half), "n": (left + width / 2 - half, top - half),
+                "ne": (right - half, top - half), "w": (left - half, top + height / 2 - half),
+                "e": (right - half, top + height / 2 - half), "sw": (left - half, bottom - half),
+                "s": (left + width / 2 - half, bottom - half), "se": (right - half, bottom - half),
+            }
+            for name, (hx, hy) in positions.items():
+                handles[name].left, handles[name].top = hx, hy
+
+            box = current_box()
+            size_label.value = f"אזור נבחר: {box[2] - box[0]} × {box[3] - box[1]} פיקסלים"
+            page.update()
+
+        def move_by(e) -> None:
+            width, height = rect[2] - rect[0], rect[3] - rect[1]
+            new_left = min(max(0.0, rect[0] + e.local_delta.x), disp_w - width)
+            new_top = min(max(0.0, rect[1] + e.local_delta.y), disp_h - height)
+            rect[:] = [new_left, new_top, new_left + width, new_top + height]
+            layout()
+
+        def resize_by(name: str, e) -> None:
+            dx, dy = e.local_delta.x, e.local_delta.y
+            if "w" in name:
+                rect[0] = min(rect[0] + dx, rect[2] - MIN_CROP_PX)
+            if "e" in name:
+                rect[2] = max(rect[2] + dx, rect[0] + MIN_CROP_PX)
+            if "n" in name:
+                rect[1] = min(rect[1] + dy, rect[3] - MIN_CROP_PX)
+            if "s" in name:
+                rect[3] = max(rect[3] + dy, rect[1] + MIN_CROP_PX)
+            layout()
+
+        async def refresh_preview() -> None:
+            preview_bytes = await asyncio.to_thread(
+                photo_service.render_crop_preview, asset, current_box()
+            )
+            preview_image.src = preview_bytes
+            page.update()
+
+        def reset_clicked(e: ft.ControlEvent) -> None:
+            # Frame-only reset: nothing on disk changes until Apply, and the
+            # untouched original is what Apply re-cuts from.
+            rect[:] = [0.0, 0.0, float(disp_w), float(disp_h)]
+            layout()
+            page.run_task(refresh_preview)
+
+        async def apply_clicked(e: ft.ControlEvent) -> None:
+            await asyncio.to_thread(photo_service.apply_crop, asset, current_box())
+            page.pop_dialog()
+            rebuild_photo_rows()
+            await maybe_generate_caption(asset)
+            rebuild_photo_rows()
+
+        def cancel_clicked(e: ft.ControlEvent) -> None:
+            page.pop_dialog()
+
+        canvas = ft.Stack(
+            controls=[
+                base_image,
+                shade_top, shade_bottom, shade_left, shade_right,
+                frame, move_detector, *handles.values(),
+            ],
+            width=disp_w,
+            height=disp_h,
+        )
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("חיתוך תמונה"),
+            content=ft.Row(
+                controls=[
+                    ft.Column(
+                        controls=[
+                            ft.Container(content=canvas, border=ft.Border.all(1, ft.Colors.OUTLINE)),
+                            ft.Text("גררו את המסגרת להזזה, ואת הריבועים הלבנים לשינוי הגודל.", size=12),
+                            size_label,
+                        ],
+                        tight=True,
+                        spacing=6,
+                    ),
+                    ft.Column(
+                        controls=[ft.Text("תצוגה מקדימה", size=12, weight=ft.FontWeight.BOLD), preview_image],
+                        tight=True,
+                        spacing=6,
+                    ),
+                ],
+                spacing=16,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+                tight=True,
+            ),
+            actions=[
+                ft.TextButton("ביטול", on_click=cancel_clicked),
+                ft.TextButton("אפס חיתוך", on_click=reset_clicked),
+                ft.ElevatedButton("החל חיתוך", on_click=apply_clicked),
+            ],
+        )
+        page.show_dialog(dialog)
+        layout()
+        await refresh_preview()
 
     def build_photo_row(asset: photo_service.PhotoAsset) -> ft.Control:
         thumbnail = ft.Image(
@@ -185,11 +426,11 @@ async def main(page: ft.Page):
                         ft.Text("קיימת הצעת חיתוך לתמונה זו:", size=12),
                         ft.TextButton(
                             "אשר חיתוך מוצע",
-                            on_click=lambda e, pid=asset.photo_id: approve_crop(pid),
+                            on_click=lambda e, pid=asset.photo_id: page.run_task(approve_crop, pid),
                         ),
                         ft.TextButton(
                             "השאר תמונה מקורית",
-                            on_click=lambda e, pid=asset.photo_id: keep_original(pid),
+                            on_click=lambda e, pid=asset.photo_id: page.run_task(keep_original, pid),
                         ),
                     ]
                 )
@@ -197,8 +438,14 @@ async def main(page: ft.Page):
         elif asset.approved_crop:
             crop_controls.append(ft.Text("נבחר חיתוך מותאם ✓", size=12, color=ft.Colors.GREEN_700))
 
+        crop_button = ft.TextButton(
+            "חיתוך",
+            icon=ft.Icons.CROP,
+            on_click=lambda e, pid=asset.photo_id: page.run_task(open_crop_dialog, pid),
+        )
+
         info_column = ft.Column(
-            controls=[caption_field, *crop_controls],
+            controls=[caption_field, crop_button, *crop_controls],
             spacing=4,
         )
 
@@ -223,7 +470,6 @@ async def main(page: ft.Page):
 
     def rebuild_photo_rows() -> None:
         photos_list_view.controls = [build_photo_row(asset) for asset in photos]
-        refresh_photo_page_count_hint()
         page.update()
 
     def handle_reorder(e: ft.OnReorderEvent) -> None:
@@ -261,22 +507,31 @@ async def main(page: ft.Page):
                     errors.append(str(exc))
             return new_assets
 
-        set_status("מעבד תמונות...")
+        set_status("מעבד תמונות...", "progress")
         new_assets = await asyncio.to_thread(ingest_all)
         photos.extend(new_assets)
         rebuild_photo_rows()
 
+        if new_assets:
+            set_status("יוצר כיתובים אוטומטיים...", "progress")
+            for asset in new_assets:
+                await maybe_generate_caption(asset)
+            rebuild_photo_rows()
+
         if errors:
-            set_status(" | ".join(errors), error=True)
+            set_status(" | ".join(errors), "error")
         else:
-            set_status(f"נוספו {len(new_assets)} תמונות." if new_assets else "לא נוספו תמונות.")
+            set_status(
+                f"נוספו {len(new_assets)} תמונות." if new_assets else "לא נוספו תמונות.",
+                "success" if new_assets else "info",
+            )
 
     add_photos_button = ft.ElevatedButton(
         "הוסף תמונות", icon=ft.Icons.ADD_PHOTO_ALTERNATE, on_click=add_photos_clicked
     )
 
     # ---------------------------------------------------------- required-field check
-    def collect_raw_inputs() -> ai_service.ReportInputs | None:
+    def collect_report_inputs() -> report_builder.ReportInputs | None:
         missing = []
         if not report_number_field.value:
             missing.append("מספר בדיקה")
@@ -286,14 +541,12 @@ async def main(page: ft.Page):
             missing.append("שם לקוח/חברה")
         if not subject_field.value:
             missing.append("נושא הדוח")
-        if not findings_notes_field.value:
-            missing.append("ממצאים עיקריים")
 
         if missing:
-            set_status("שדות חסרים: " + ", ".join(missing), error=True)
+            set_status("שדות חסרים: " + ", ".join(missing), "error")
             return None
 
-        return ai_service.ReportInputs(
+        return report_builder.ReportInputs(
             report_number=report_number_field.value or "",
             report_date=report_date_field.value or "",
             client_contact_name=client_contact_name_field.value or "",
@@ -308,44 +561,11 @@ async def main(page: ft.Page):
             material=material_field.value or "",
             inspection_nature=inspection_nature_field.value or "",
             license_number=license_number_field.value or "",
-            findings_notes=findings_notes_field.value or "",
-            actions_taken=actions_taken_field.value or "",
-            comments=comments_field.value or "",
-            photo_count=len(photos),
         )
-
-    # ------------------------------------------------------------ AI draft
-    async def generate_draft_clicked(e: ft.ControlEvent) -> None:
-        inputs = collect_raw_inputs()
-        if inputs is None:
-            return
-
-        set_status("שולח בקשה למנוע ה-AI...")
-        generate_draft_button.disabled = True
-        page.update()
-        try:
-            service = await asyncio.to_thread(ai_service.build_ai_service)
-            result = await asyncio.to_thread(service.generate_report_text, inputs)
-            general_review_field.value = _join_paragraphs(result.general_paragraphs)
-            findings_review_field.value = _join_paragraphs(result.findings_paragraphs)
-            discussion_review_field.value = _join_paragraphs(result.discussion_paragraphs)
-            set_status("טיוטה נוצרה. ניתן לערוך את הטקסט למטה לפני יצירת הדוח הסופי.")
-        except ai_service.AIServiceError as exc:
-            set_status(f"שגיאת AI: {exc}", error=True)
-        except Exception:
-            set_status("שגיאה בלתי צפויה ביצירת הטיוטה. פרטים בקונסולה.", error=True)
-            traceback.print_exc()
-        finally:
-            generate_draft_button.disabled = False
-            page.update()
-
-    generate_draft_button = ft.ElevatedButton(
-        "צור טיוטת טקסט עם AI", icon=ft.Icons.AUTO_AWESOME, on_click=generate_draft_clicked
-    )
 
     # ------------------------------------------------------------ final build
     async def generate_report_clicked(e: ft.ControlEvent) -> None:
-        inputs = collect_raw_inputs()
+        inputs = collect_report_inputs()
         if inputs is None:
             return
 
@@ -353,11 +573,11 @@ async def main(page: ft.Page):
         findings_paragraphs = _split_paragraphs(findings_review_field.value)
         discussion_paragraphs = _split_paragraphs(discussion_review_field.value)
 
-        if not (general_paragraphs and findings_paragraphs):
-            set_status("יש למלא לפחות טקסט ל'כללי' ול'ממצאים' (ניתן ללחוץ קודם על יצירת טיוטה).", error=True)
+        if not (general_paragraphs and findings_paragraphs and discussion_paragraphs):
+            set_status("יש למלא טקסט בכל שלושת הפרקים: כללי, ממצאים ודיון ומסקנות.", "error")
             return
 
-        generated_text = ai_service.GeneratedReportText(
+        body_text = report_builder.ReportBodyText(
             general_paragraphs=general_paragraphs,
             findings_paragraphs=findings_paragraphs,
             discussion_paragraphs=discussion_paragraphs,
@@ -365,24 +585,26 @@ async def main(page: ft.Page):
 
         render_data = report_builder.ReportRenderData(
             inputs=inputs,
-            generated_text=generated_text,
+            body_text=body_text,
             photos=list(photos),
-            page_count=page_count_field.value or "",
-            photo_page_count=photo_page_count_field.value or "",
         )
 
-        set_status("יוצר קובץ Word...")
+        set_status("יוצר קובץ Word...", "progress")
         generate_report_button.disabled = True
         page.update()
         try:
-            output_path = await asyncio.to_thread(report_builder.build_report, render_data)
-            set_status(f"הדוח נשמר בהצלחה: {output_path.name}")
+            output_path, warning = await asyncio.to_thread(report_builder.build_report, render_data)
+            message = f"הדוח נשמר בהצלחה: {output_path.name}"
+            if warning:
+                # The .docx was still produced - a warning, not a failure.
+                message += f" ({warning})"
+            set_status(message, "warning" if warning else "success")
             try:
                 os.startfile(str(config.REPORTS_DIR))  # noqa: S606 - Windows-only app
             except OSError:
                 pass
         except Exception as exc:
-            set_status(f"שגיאה ביצירת הדוח: {exc}", error=True)
+            set_status(f"שגיאה ביצירת הדוח: {exc}", "error")
             traceback.print_exc()
         finally:
             generate_report_button.disabled = False
@@ -416,7 +638,6 @@ async def main(page: ft.Page):
             controls=[
                 ft.Text(config.APP_TITLE_HE, size=26, weight=ft.FontWeight.BOLD),
                 ft.Text("מחולל דוחות מעבדה הנדסית - הזן פרטים קצרים וצרף תמונות", size=14),
-                status_text,
                 section(
                     "פרטי הדוח",
                     [
@@ -442,22 +663,23 @@ async def main(page: ft.Page):
                             ],
                             wrap=True,
                         ),
-                        ft.Row([page_count_field, photo_page_count_field], wrap=True),
                     ],
                 ),
                 section(
-                    "תיאור המקרה (במילים שלך - ה-AI לא ימציא עובדות)",
-                    [findings_notes_field, actions_taken_field, comments_field],
+                    "טקסט הדוח - כללי, ממצאים ודיון ומסקנות",
+                    [general_review_field, findings_review_field, discussion_review_field],
                 ),
                 section(
                     "תמונות",
                     [add_photos_button, photos_list_view],
                 ),
-                section(
-                    "טקסט הדוח - ניתן ליצור טיוטה ואז לערוך",
-                    [generate_draft_button, general_review_field, findings_review_field, discussion_review_field],
+                # Status sits with the button, not at the top of the page, so
+                # the user never has to scroll up to see why a build failed.
+                ft.Row(
+                    [status.control, generate_report_button],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
-                ft.Row([generate_report_button], alignment=ft.MainAxisAlignment.END),
             ],
         )
     )

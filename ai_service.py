@@ -1,23 +1,26 @@
-"""Provider-agnostic AI text-generation service.
+"""Provider-agnostic AI photo-captioning service.
 
-Turns the user's short, factual inputs into structured Hebrew report text
-(the "כללי" / "ממצאים" / "דיון ומסקנות" sections) written in the lab's house
-style. The model is instructed, repeatedly and explicitly, to never invent
-facts: it may only rephrase/organize what the user actually typed.
+Given a single (already resized/cropped) photo, asks a vision-capable model
+to write one short Hebrew caption describing only what is generically visible
+in the image (component type, camera angle, general/close-up view). The model
+is instructed, repeatedly and explicitly, to never state or imply a lab
+finding, measurement, cause, or conclusion — those belong exclusively to the
+user-authored "ממצאים"/"דיון ומסקנות" report sections.
 
 Usage:
     service = build_ai_service()  # reads AI_PROVIDER from .env
-    result = service.generate_report_text(inputs)
+    caption = service.generate_photo_caption(photo_path)
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 from abc import ABC, abstractmethod
-from typing import List
+from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 import config
 
@@ -26,65 +29,28 @@ class AIServiceError(RuntimeError):
     """Raised for configuration problems, provider errors, or invalid responses."""
 
 
-class ReportInputs(BaseModel):
-    """Raw, user-supplied facts. Nothing here is invented by the AI — it is
-    only reorganized and written up in fluent Hebrew report style."""
-
-    report_number: str
-    report_date: str
-
-    client_contact_name: str = ""
-    client_company: str = ""
-    client_address: str = ""
-    client_city: str = ""
-
-    subject: str
-    claim_number: str = ""
-
-    item: str = ""
-    assembly: str = ""
-    manufacturer_model: str = ""
-    material: str = ""
-    inspection_nature: str = ""
-    license_number: str = ""
-
-    findings_notes: str = Field(..., description="User's raw findings, in their own words")
-    actions_taken: str = Field("", description="User's raw notes on actions taken during inspection")
-    comments: str = Field("", description="Any additional free-form comments from the user")
-
-    photo_count: int = 0
-
-
-class GeneratedReportText(BaseModel):
-    """Structured Hebrew report text, matching the template's free-text sections."""
+class PhotoCaption(BaseModel):
+    """A single AI-suggested Hebrew caption for one photo."""
 
     model_config = ConfigDict(extra="forbid")
 
-    general_paragraphs: List[str] = Field(default_factory=list)
-    findings_paragraphs: List[str] = Field(default_factory=list)
-    discussion_paragraphs: List[str] = Field(default_factory=list)
+    caption: str
 
 
-REPORT_TEXT_JSON_SCHEMA = {
+PHOTO_CAPTION_JSON_SCHEMA = {
     "type": "object",
     "properties": {
-        "general_paragraphs": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "1-3 Hebrew paragraphs for the 'כללי' (General/circumstances) section.",
-        },
-        "findings_paragraphs": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Hebrew paragraphs for the 'ממצאים' (Findings) section.",
-        },
-        "discussion_paragraphs": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Hebrew paragraphs for the 'דיון ומסקנות' (Discussion & Conclusions) section.",
+        "caption": {
+            "type": "string",
+            "description": (
+                "One short Hebrew caption describing only what is generically visible in "
+                "the photo (component type, camera angle, general/close-up view). Must "
+                "never state or imply a lab finding, damage, measurement, cause, or "
+                "conclusion."
+            ),
         },
     },
-    "required": ["general_paragraphs", "findings_paragraphs", "discussion_paragraphs"],
+    "required": ["caption"],
     "additionalProperties": False,
 }
 
@@ -95,62 +61,42 @@ def _load_text(path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def build_prompt(inputs: ReportInputs) -> tuple[str, str]:
-    """Builds (system_prompt, user_message) for the AI call."""
+def build_caption_prompt() -> tuple[str, str]:
+    """Builds (system_prompt, user_message) for a photo-captioning call."""
     style_guide = _load_text(config.STYLE_GUIDE_PATH)
-    template_text = _load_text(config.REPORT_PROMPT_PATH)
-
-    facts = {
-        "מספר בדיקה": inputs.report_number,
-        "תאריך": inputs.report_date,
-        "לקוח/מזמין": inputs.client_contact_name,
-        "חברה": inputs.client_company,
-        "נושא": inputs.subject,
-        "מספר תביעה": inputs.claim_number,
-        "פריט": inputs.item,
-        "מכלול": inputs.assembly,
-        "יצרן/דגם": inputs.manufacturer_model,
-        "חומר": inputs.material,
-        "מהות הבדיקה": inputs.inspection_nature,
-        "מספר רישוי": inputs.license_number,
-        "ממצאים (הערות המשתמש)": inputs.findings_notes,
-        "פעולות שבוצעו": inputs.actions_taken,
-        "הערות נוספות": inputs.comments,
-        "מספר תמונות מצורפות": inputs.photo_count,
-    }
-    facts_text = "\n".join(f"- {key}: {value}" for key, value in facts.items() if value not in ("", None))
+    template_text = _load_text(config.CAPTION_PROMPT_PATH)
 
     system_prompt = template_text or _DEFAULT_PROMPT
     system_prompt = system_prompt.replace("{{style_guide}}", style_guide or "(אין מדריך סגנון זמין)")
 
     user_message = (
-        "להלן העובדות שמסר המשתמש. ארגן וכתוב אותן בעברית, בסגנון הדוחות של המעבדה, "
-        "בפורמט JSON התואם את הסכימה שסופקה. אסור להוסיף כל עובדה, ממצא, מדידה, תאריך "
-        "או מסקנה שלא נמסרו במפורש להלן.\n\n" + facts_text
+        "כתוב כיתוב קצר אחד בעברית לתמונה המצורפת, בהתאם לחוקים שהוגדרו. "
+        "החזר אך ורק JSON התואם את הסכימה שסופקה."
     )
     return system_prompt, user_message
 
 
 _DEFAULT_PROMPT = """\
-אתה כותב הנדסי המסייע למעבדה הנדסית לחקר כשלים לנסח דוחות בעברית תקנית וברורה.
+אתה כותב הנדסי המסייע למעבדה הנדסית לחקר כשלים לכתוב כיתובי תמונות קצרים בעברית.
 
 מדריך הסגנון של המעבדה:
 {{style_guide}}
 
 חוקים מחייבים:
-1. כתוב עברית בלבד, בעברית תקנית, בגוף ראשון יחיד (״ביקרתי״, ״מצאתי״ וכו׳) בהתאם לסגנון המעבדה.
-2. אסור בהחלט להמציא ממצאים, מדידות, תאריכים, פעולות או מסקנות שלא נמסרו על ידי המשתמש.
-   אם מידע חסר, אין להשלים אותו - יש פשוט לנסח בקצרה את מה שכן נמסר.
-3. אין להתייחס לתוכן חזותי של תמונות שלא תואר במפורש בטקסט שנמסר.
+1. כתוב כיתוב קצר אחד בעברית תקנית (עד משפט קצר) המתאר אך ורק מה שנראה גנרית
+   בתמונה (למשל: סוג המכלול/הרכיב המצולם, זווית הצילום, מבט כללי/מבט מקרוב).
+2. אסור בהחלט לקבוע, לרמוז או להמציא ממצא, נזק, מדידה, מנגנון כשל, סיבה או
+   מסקנה על סמך התמונה - אלו שייכים אך ורק למשתמש בפרקי "ממצאים" ו"דיון ומסקנות".
+3. אם אינך בטוח מה מוצג בתמונה, כתוב תיאור כללי וזהיר בלבד, ולעולם אל תנחש פרטים טכניים.
 4. החזר אך ורק JSON תקני התואם את הסכימה שסופקה, ללא טקסט נוסף.
 """
 
 
 class AIService(ABC):
-    """Provider-independent interface for generating structured report text."""
+    """Provider-independent interface for generating a photo caption."""
 
     @abstractmethod
-    def generate_report_text(self, inputs: ReportInputs) -> GeneratedReportText:
+    def generate_photo_caption(self, image_path: Path) -> str:
         raise NotImplementedError
 
 
@@ -164,7 +110,13 @@ def _validate_api_key(provider_name: str) -> str:
 
 
 class _RetryingAIService(AIService):
-    """Shared retry/timeout/error-handling wrapper around a provider call."""
+    """Shared retry/timeout/error-handling wrapper around a provider call.
+
+    The only provider-specific piece any adapter must implement is
+    `_call_model(system_prompt, user_message, image_bytes, media_type)`,
+    keeping this interface easy to extend with further providers (e.g. a
+    future Gemini adapter) without touching the retry/parsing logic.
+    """
 
     provider_name = "base"
 
@@ -174,36 +126,38 @@ class _RetryingAIService(AIService):
         self.timeout = timeout
         self.max_retries = max_retries
 
-    def generate_report_text(self, inputs: ReportInputs) -> GeneratedReportText:
-        system_prompt, user_message = build_prompt(inputs)
+    def generate_photo_caption(self, image_path: Path) -> str:
+        system_prompt, user_message = build_caption_prompt()
+        image_bytes = image_path.read_bytes()
+        media_type = "image/jpeg"  # photo_service always saves final/cropped images as JPEG
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                raw_json = self._call_model(system_prompt, user_message)
-                return self._parse_response(raw_json)
+                raw_json = self._call_model(system_prompt, user_message, image_bytes, media_type)
+                return self._parse_response(raw_json).caption.strip()
             except (AIServiceError, ValidationError, json.JSONDecodeError) as exc:
                 last_error = exc
             except Exception as exc:  # provider SDK errors (timeouts, HTTP errors, etc.)
                 last_error = exc
             if attempt < self.max_retries:
-                time.sleep(min(2 ** attempt, 8))
+                time.sleep(min(2**attempt, 8))
 
         raise AIServiceError(
             f"{self.provider_name} provider failed after {self.max_retries + 1} attempt(s): {last_error}"
         ) from last_error
 
-    def _call_model(self, system_prompt: str, user_message: str) -> str:
+    def _call_model(self, system_prompt: str, user_message: str, image_bytes: bytes, media_type: str) -> str:
         raise NotImplementedError
 
     @staticmethod
-    def _parse_response(raw_json: str) -> GeneratedReportText:
+    def _parse_response(raw_json: str) -> PhotoCaption:
         try:
             data = json.loads(raw_json)
         except json.JSONDecodeError as exc:
             raise AIServiceError(f"Model did not return valid JSON: {exc}") from exc
         try:
-            return GeneratedReportText.model_validate(data)
+            return PhotoCaption.model_validate(data)
         except ValidationError as exc:
             raise AIServiceError(f"Model JSON did not match the expected schema: {exc}") from exc
 
@@ -217,18 +171,33 @@ class AnthropicAIService(_RetryingAIService):
 
         self._client = anthropic.Anthropic(api_key=api_key, timeout=timeout)
 
-    def _call_model(self, system_prompt: str, user_message: str) -> str:
-        tool_name = "submit_report_text"
+    def _call_model(self, system_prompt: str, user_message: str, image_bytes: bytes, media_type: str) -> str:
+        tool_name = "submit_photo_caption"
         response = self._client.messages.create(
             model=self.model or "claude-sonnet-4-5",
-            max_tokens=4096,
+            max_tokens=1024,
             system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": base64.b64encode(image_bytes).decode("ascii"),
+                            },
+                        },
+                        {"type": "text", "text": user_message},
+                    ],
+                }
+            ],
             tools=[
                 {
                     "name": tool_name,
-                    "description": "Submit the structured Hebrew report text.",
-                    "input_schema": REPORT_TEXT_JSON_SCHEMA,
+                    "description": "Submit the suggested Hebrew photo caption.",
+                    "input_schema": PHOTO_CAPTION_JSON_SCHEMA,
                 }
             ],
             tool_choice={"type": "tool", "name": tool_name},
@@ -248,18 +217,25 @@ class OpenAIAIService(_RetryingAIService):
 
         self._client = openai.OpenAI(api_key=api_key, timeout=timeout)
 
-    def _call_model(self, system_prompt: str, user_message: str) -> str:
+    def _call_model(self, system_prompt: str, user_message: str, image_bytes: bytes, media_type: str) -> str:
+        data_url = f"data:{media_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
         response = self._client.chat.completions.create(
             model=self.model or "gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_message},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
             ],
             response_format={
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "report_text",
-                    "schema": REPORT_TEXT_JSON_SCHEMA,
+                    "name": "photo_caption",
+                    "schema": PHOTO_CAPTION_JSON_SCHEMA,
                     "strict": True,
                 },
             },
@@ -273,6 +249,9 @@ class OpenAIAIService(_RetryingAIService):
 _PROVIDERS = {
     "anthropic": AnthropicAIService,
     "openai": OpenAIAIService,
+    # A future Gemini adapter only needs its own _call_model implementation
+    # (via google-generativeai's multimodal generate_content) registered here
+    # under "gemini" — no other changes required.
 }
 
 

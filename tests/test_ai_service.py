@@ -9,58 +9,29 @@ import ai_service
 import config
 
 
-def test_report_inputs_requires_findings_notes():
+def test_photo_caption_accepts_valid_payload():
+    caption = ai_service.PhotoCaption(caption="מבט כללי על הרכיב הנבדק.")
+    assert caption.caption == "מבט כללי על הרכיב הנבדק."
+
+
+def test_photo_caption_rejects_extra_fields():
     with pytest.raises(ValidationError):
-        ai_service.ReportInputs(
-            report_number="C1",
-            report_date="30.07.26",
-            subject="נושא",
-        )
+        ai_service.PhotoCaption(caption="כיתוב", unexpected_field=123)
 
 
-def test_report_inputs_accepts_minimal_valid_data():
-    inputs = ai_service.ReportInputs(
-        report_number="C1",
-        report_date="30.07.26",
-        subject="נושא",
-        findings_notes="ממצא כלשהו",
-    )
-    assert inputs.claim_number == ""
-    assert inputs.photo_count == 0
-
-
-def test_generated_report_text_defaults_to_empty_lists():
-    text = ai_service.GeneratedReportText()
-    assert text.general_paragraphs == []
-    assert text.findings_paragraphs == []
-    assert text.discussion_paragraphs == []
-
-
-def test_generated_report_text_rejects_non_list_field():
-    with pytest.raises(ValidationError):
-        ai_service.GeneratedReportText(general_paragraphs="not a list")
-
-
-def test_build_prompt_includes_style_guide_and_user_facts(tmp_path, monkeypatch):
+def test_build_caption_prompt_includes_style_guide(tmp_path, monkeypatch):
     style_guide = tmp_path / "style_guide.md"
     style_guide.write_text("סגנון: כתוב בגוף ראשון.", encoding="utf-8")
-    prompt_file = tmp_path / "report_prompt.txt"
+    prompt_file = tmp_path / "caption_prompt.txt"
     prompt_file.write_text("הנחיות מערכת:\n{{style_guide}}\n", encoding="utf-8")
 
     monkeypatch.setattr(config, "STYLE_GUIDE_PATH", style_guide)
-    monkeypatch.setattr(config, "REPORT_PROMPT_PATH", prompt_file)
+    monkeypatch.setattr(config, "CAPTION_PROMPT_PATH", prompt_file)
 
-    inputs = ai_service.ReportInputs(
-        report_number="C1",
-        report_date="30.07.26",
-        subject="נזק לדוגמה",
-        findings_notes="נמצא סדק",
-    )
-    system_prompt, user_message = ai_service.build_prompt(inputs)
+    system_prompt, user_message = ai_service.build_caption_prompt()
 
     assert "כתוב בגוף ראשון" in system_prompt
-    assert "נזק לדוגמה" in user_message
-    assert "נמצא סדק" in user_message
+    assert user_message  # a fixed instruction, no per-report facts needed
 
 
 def test_build_ai_service_requires_api_key(monkeypatch):
@@ -78,13 +49,7 @@ def test_build_ai_service_rejects_unknown_provider(monkeypatch):
 
 
 def _valid_payload() -> str:
-    return json.dumps(
-        {
-            "general_paragraphs": ["פסקה כללית."],
-            "findings_paragraphs": ["ממצא ראשון."],
-            "discussion_paragraphs": ["מסקנה."],
-        }
-    )
+    return json.dumps({"caption": "מבט כללי על הרכיב."})
 
 
 class _FlakyService(ai_service._RetryingAIService):
@@ -94,11 +59,13 @@ class _FlakyService(ai_service._RetryingAIService):
         self.fail_times = fail_times
         self.payload = payload
         self.calls = 0
+        self.received_image_bytes = None
         self.max_retries = fail_times + 1  # always enough attempts to eventually succeed
         self.timeout = 1
 
-    def _call_model(self, system_prompt: str, user_message: str) -> str:
+    def _call_model(self, system_prompt: str, user_message: str, image_bytes: bytes, media_type: str) -> str:
         self.calls += 1
+        self.received_image_bytes = image_bytes
         if self.calls <= self.fail_times:
             raise TimeoutError("simulated transient failure")
         return self.payload
@@ -112,30 +79,33 @@ class _AlwaysFailingService(ai_service._RetryingAIService):
         self.max_retries = max_retries
         self.timeout = 1
 
-    def _call_model(self, system_prompt: str, user_message: str) -> str:
+    def _call_model(self, system_prompt: str, user_message: str, image_bytes: bytes, media_type: str) -> str:
         self.calls += 1
         raise TimeoutError("simulated permanent failure")
 
 
-def test_retry_succeeds_after_transient_failures(monkeypatch):
+def test_retry_succeeds_after_transient_failures(monkeypatch, tmp_path):
     monkeypatch.setattr(ai_service.time, "sleep", lambda _seconds: None)
+    image_path = tmp_path / "photo.jpg"
+    image_bytes = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
+    image_path.write_bytes(image_bytes)
+
     service = _FlakyService(fail_times=2, payload=_valid_payload())
-    inputs = ai_service.ReportInputs(
-        report_number="C1", report_date="30.07.26", subject="נושא", findings_notes="ממצא"
-    )
-    result = service.generate_report_text(inputs)
-    assert result.general_paragraphs == ["פסקה כללית."]
+    caption = service.generate_photo_caption(image_path)
+
+    assert caption == "מבט כללי על הרכיב."
     assert service.calls == 3
+    assert service.received_image_bytes == image_bytes
 
 
-def test_retry_exhausted_raises_ai_service_error(monkeypatch):
+def test_retry_exhausted_raises_ai_service_error(monkeypatch, tmp_path):
     monkeypatch.setattr(ai_service.time, "sleep", lambda _seconds: None)
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"fake-jpeg-bytes")
+
     service = _AlwaysFailingService(max_retries=2)
-    inputs = ai_service.ReportInputs(
-        report_number="C1", report_date="30.07.26", subject="נושא", findings_notes="ממצא"
-    )
     with pytest.raises(ai_service.AIServiceError):
-        service.generate_report_text(inputs)
+        service.generate_photo_caption(image_path)
     assert service.calls == 3  # initial attempt + 2 retries
 
 
@@ -146,9 +116,9 @@ def test_parse_response_rejects_invalid_json():
 
 def test_parse_response_rejects_schema_mismatch():
     with pytest.raises(ai_service.AIServiceError):
-        ai_service._RetryingAIService._parse_response(json.dumps({"unexpected_field": 123}))
+        ai_service._RetryingAIService._parse_response(json.dumps({"caption": ["not", "a", "string"]}))
 
 
 def test_parse_response_accepts_valid_payload():
     result = ai_service._RetryingAIService._parse_response(_valid_payload())
-    assert result.findings_paragraphs == ["ממצא ראשון."]
+    assert result.caption == "מבט כללי על הרכיב."

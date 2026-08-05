@@ -30,8 +30,11 @@ from __future__ import annotations
 import copy
 import shutil
 from pathlib import Path
+from typing import Optional
 
 import docx
+from docx.oxml.ns import qn
+from docx.shared import Pt
 from docx.text.paragraph import Paragraph
 
 import config
@@ -58,15 +61,36 @@ def _clear_runs_keep_first(paragraph: Paragraph, new_text: str) -> None:
         extra._element.getparent().remove(extra._element)
 
 
-def _append_jinja_tag(paragraph: Paragraph, tag_text: str) -> None:
-    """Append a new run at the end of a paragraph, cloning formatting from the
-    paragraph's last existing run so RTL/font/size survive untouched."""
+def _append_jinja_tag(paragraph: Paragraph, tag_text: str, rpr_source_run: Optional[object] = None) -> None:
+    """Append a new run at the end of a paragraph, cloning formatting from
+    `rpr_source_run` (or, by default, the paragraph's own last existing run)
+    so RTL/font/size survive untouched."""
     runs = paragraph.runs
-    last_rpr = runs[-1]._element.rPr if runs else None
+    source_run = rpr_source_run if rpr_source_run is not None else (runs[-1] if runs else None)
+    source_rpr = source_run._element.rPr if source_run is not None else None
     new_run = paragraph.add_run(tag_text)
-    if last_rpr is not None:
+    if source_rpr is not None:
         new_run._element.get_or_add_rPr()
-        new_run._element.replace(new_run._element.rPr, copy.deepcopy(last_rpr))
+        new_run._element.replace(new_run._element.rPr, copy.deepcopy(source_rpr))
+
+
+def _replace_run_span_with_tag(paragraph: Paragraph, exact_text: str, tag_text: str) -> None:
+    """Replaces a placeholder that may span multiple runs (rather than being
+    fully contained in one, as `_replace_exact_run` requires) with a single
+    Jinja-tag run, preserving the first matched run's character formatting."""
+    runs = paragraph.runs
+    for start in range(len(runs)):
+        acc = ""
+        for end in range(start, len(runs)):
+            acc += runs[end].text
+            if acc == exact_text:
+                runs[start].text = tag_text
+                for extra in runs[start + 1 : end + 1]:
+                    extra._element.getparent().remove(extra._element)
+                return
+            if not exact_text.startswith(acc):
+                break
+    raise TemplateStructureError(f"Could not find run span {exact_text!r} in paragraph {paragraph.text!r}")
 
 
 def _replace_exact_run(paragraph: Paragraph, exact_text: str, new_text: str) -> None:
@@ -202,11 +226,27 @@ def _edit_case_info_tables(doc: docx.Document) -> None:
     table0 = doc.tables[0]
     number_p = table0.rows[0].cells[0].paragraphs[0]
     _expect("מס' בדיקה" in number_p.text, f"Unexpected table0 cell: {number_p.text!r}")
-    _append_jinja_tag(number_p, "{{ report_number }}")
+
+    # The paragraph's OWN last run carries the bold 17pt label formatting
+    # (sz=34/szCs=24), which is meant for the Hebrew label text, not a typed
+    # value - appending the jinja tag with that formatting made the entered
+    # report number/date visibly mismatch the rest of the info box. Real,
+    # human-filled reference reports show the manually-typed value uses this
+    # cell's smaller un-styled run instead (11pt, no bidi); clone from that
+    # run (index 1: the anomalous placeholder space already sitting in the
+    # canonical template right after the label) for both fields instead.
+    value_rpr_source = number_p.runs[1]
+    _expect(
+        value_rpr_source.text == " " and value_rpr_source.font.size == Pt(11),
+        "Expected the info-box's 11pt placeholder run (used as the formatting "
+        "source for the entered report number/date) at index 1 of the "
+        "'מס' בדיקה' paragraph; template structure may have changed.",
+    )
+    _append_jinja_tag(number_p, "{{ report_number }}", rpr_source_run=value_rpr_source)
 
     date_p = table0.rows[0].cells[0].paragraphs[1]
     _expect("תאריך" in date_p.text, f"Unexpected table0 cell: {date_p.text!r}")
-    _append_jinja_tag(date_p, "{{ report_date }}")
+    _append_jinja_tag(date_p, "{{ report_date }}", rpr_source_run=value_rpr_source)
 
     pages_p = table0.rows[1].cells[0].paragraphs[0]
     _replace_exact_run(pages_p, "ל * ", "ל {{ page_count }} ")
@@ -226,6 +266,40 @@ def _edit_case_info_tables(doc: docx.Document) -> None:
     _append_jinja_tag(license_p, "{{ license_number }}")
 
 
+def _edit_page_header(doc: docx.Document) -> None:
+    """The default (non-first-page) header already carries real, dynamic
+    Word `PAGE`/`NUMPAGES` fields for the "-N-" / "מתוך M עמודים" lines - only
+    the report-number line is a literal, never-filled "*מספר בדיקה*"
+    placeholder. Replace it with the Jinja tag so every regular report/photo
+    page shows the real report number, matching the reference layout."""
+    header = doc.sections[0].header
+    _expect(
+        not header.is_linked_to_previous,
+        "Expected the default section header to be its own (non-inherited) part",
+    )
+    target_p = header.paragraphs[-1]
+    _expect(
+        "מספר בדיקה" in target_p.text,
+        f"Unexpected trailing header paragraph: {target_p.text!r}",
+    )
+    _replace_run_span_with_tag(target_p, "*מספר בדיקה*", "{{ report_number }}")
+
+
+def _enable_update_fields_on_open(doc: docx.Document) -> None:
+    """Sets <w:updateFields val="true"/> in settings.xml so Word silently
+    recomputes every field - here, only the header's PAGE/NUMPAGES fields -
+    to their real values the instant the generated report is opened.
+
+    python-docx/docxtpl never touch Word's own field-result cache, so
+    without this setting the header would keep showing whatever page
+    numbers were cached the last time a human edited the canonical template
+    in Word, until something forces a recalculation."""
+    settings = doc.settings.element
+    if settings.find(qn("w:updateFields")) is None:
+        update_fields = settings.makeelement(qn("w:updateFields"), {qn("w:val"): "true"})
+        settings.insert(0, update_fields)
+
+
 def build_compiled_template(force: bool = False) -> Path:
     """Build (or reuse a cached copy of) the Jinja-tagged template.
 
@@ -243,9 +317,11 @@ def build_compiled_template(force: bool = False) -> Path:
 
     doc = docx.Document(str(target))
     _edit_case_info_tables(doc)
+    _edit_page_header(doc)
     _edit_client_and_case_fields(doc)
     discussion_endfor = _edit_free_text_sections(doc)
     _replace_photo_skeleton_with_marker(doc, after_paragraph=discussion_endfor)
+    _enable_update_fields_on_open(doc)
     doc.save(str(target))
 
     return target

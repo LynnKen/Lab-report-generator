@@ -32,6 +32,11 @@ def isolated_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "PHOTOS_PREVIEWS_DIR", previews_dir)
     monkeypatch.setattr(config, "PHOTOS_FINAL_DIR", final_dir)
 
+    # Real page counting requires MS Word installed; keep the test suite
+    # hermetic and fast by disabling it here. tests/test_word_page_counter.py
+    # covers the automation logic itself with a mocked win32com.
+    monkeypatch.setattr(config, "PAGE_COUNT_AUTOMATION_ENABLED", False)
+
     return {
         "generated_dir": generated_dir,
         "reports_dir": reports_dir,

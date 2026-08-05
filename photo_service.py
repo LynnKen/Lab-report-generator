@@ -8,6 +8,7 @@ the UI shows the user; the final crop is whatever the user approves via
 
 from __future__ import annotations
 
+import io
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,8 +37,8 @@ class PhotoAsset:
     height: int
     suggested_crop_box: Optional[BoundingBox] = None
     user_crop_box: Optional[BoundingBox] = None
-    suggested_caption: Optional[str] = None
     caption: str = ""
+    caption_is_manual: bool = False
     order_index: int = 0
     approved_crop: bool = False
     crop_reviewed: bool = False
@@ -115,6 +116,66 @@ def _heuristic_center_crop(img: Image.Image) -> BoundingBox:
     left = (width - new_w) // 2
     top = (height - new_h) // 2
     return (left, top, left + new_w, top + new_h)
+
+
+def display_size_for(width: int, height: int, max_dimension: int) -> Tuple[int, int]:
+    """Returns the on-screen size the (uncropped) photo is drawn at inside the
+    crop dialog: scaled to fit `max_dimension` on its longest side, never
+    upscaled, and always preserving the aspect ratio so the visual crop frame
+    maps 1:1 onto real image content."""
+    scale = min(1.0, max_dimension / max(width, height))
+    return (max(1, round(width * scale)), max(1, round(height * scale)))
+
+
+def display_box_to_original(
+    crop_box: BoundingBox,
+    display_width: int,
+    display_height: int,
+    original_width: int,
+    original_height: int,
+) -> BoundingBox:
+    """Converts a crop rectangle drawn in on-screen (display) pixels into
+    original-image pixels.
+
+    This is the bridge between what the user framed in the crop dialog and
+    what actually gets cut out of the full-resolution photo, so the generated
+    Word report shows exactly the region that was selected on screen."""
+    if display_width <= 0 or display_height <= 0:
+        return (0, 0, original_width, original_height)
+
+    scale_x = original_width / display_width
+    scale_y = original_height / display_height
+    left, top, right, bottom = crop_box
+
+    left = max(0, min(original_width - 1, round(left * scale_x)))
+    top = max(0, min(original_height - 1, round(top * scale_y)))
+    right = max(left + 1, min(original_width, round(right * scale_x)))
+    bottom = max(top + 1, min(original_height, round(bottom * scale_y)))
+    return (left, top, right, bottom)
+
+
+def render_uncropped_preview(asset: PhotoAsset, max_dimension: int) -> bytes:
+    """Renders the ORIGINAL, uncropped photo at display size as in-memory
+    JPEG bytes. The crop dialog always frames the full original (never an
+    already-cropped copy), which is what makes cropping non-destructive and
+    lets Reset restore the whole image."""
+    img = _open_corrected(asset.original_path)
+    preview_img = _resized_copy(img, max_dimension)
+    buffer = io.BytesIO()
+    preview_img.save(buffer, "JPEG", quality=config.PHOTO_JPEG_QUALITY)
+    return buffer.getvalue()
+
+
+def render_crop_preview(asset: PhotoAsset, crop_box: BoundingBox) -> bytes:
+    """Renders an in-memory JPEG preview of the ORIGINAL image cropped to
+    `crop_box`, without writing any files. Used by the manual crop dialog's
+    live preview before the user confirms and `apply_crop` is called."""
+    img = _open_corrected(asset.original_path)
+    cropped = img.crop(crop_box)
+    preview_img = _resized_copy(cropped, config.PHOTO_PREVIEW_MAX_DIMENSION_PX)
+    buffer = io.BytesIO()
+    preview_img.save(buffer, "JPEG", quality=config.PHOTO_JPEG_QUALITY)
+    return buffer.getvalue()
 
 
 def ingest_photo(source_path: Path, order_index: int = 0) -> PhotoAsset:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import docx
+from docx.oxml.ns import qn
 
+import config
 import photo_service
 import report_builder
-from ai_service import GeneratedReportText, ReportInputs
+from report_builder import PHOTO_APPENDIX_BOOKMARK, ReportBodyText, ReportInputs
 
 
 def _build_sample_inputs() -> ReportInputs:
@@ -23,15 +25,11 @@ def _build_sample_inputs() -> ReportInputs:
         material="פלדה",
         inspection_nature="חזותית",
         license_number="000000",
-        findings_notes="נמצא סדק בבסיס החלק.",
-        actions_taken="בוצעה בדיקה חזותית ומדידה.",
-        comments="אין הערות נוספות.",
-        photo_count=2,
     )
 
 
-def _build_sample_text() -> GeneratedReportText:
-    return GeneratedReportText(
+def _build_sample_text() -> ReportBodyText:
+    return ReportBodyText(
         general_paragraphs=["ביקרתי במוסך לבדיקת הנזק.", "התקבלו צילומים נוספים."],
         findings_paragraphs=["נמצא סדק בבסיס החלק (תמונה 1).", "החלק תקין פרט לסדק זה (תמונה 2)."],
         discussion_paragraphs=["הסדק נובע ככל הנראה מעייפות חומר."],
@@ -51,35 +49,40 @@ def _make_photos(isolated_paths, tmp_path, count=2):
     return photos
 
 
+def _bookmark_names(document: docx.Document) -> set[str]:
+    names = set()
+    for bm in document.element.body.iter(qn("w:bookmarkStart")):
+        names.add(bm.get(qn("w:name")))
+    return names
+
+
 def test_build_report_creates_expected_file(isolated_paths, tmp_path):
     photos = _make_photos(isolated_paths, tmp_path)
     data = report_builder.ReportRenderData(
         inputs=_build_sample_inputs(),
-        generated_text=_build_sample_text(),
+        body_text=_build_sample_text(),
         photos=photos,
-        page_count="2",
-        photo_page_count="1",
     )
 
-    output_path = report_builder.build_report(data)
+    output_path, warning = report_builder.build_report(data)
 
     assert output_path.exists()
     assert output_path.parent == isolated_paths["reports_dir"]
-    assert output_path.name.startswith("C0000123_30.07.26_")
-    assert output_path.suffix == ".docx"
+    assert output_path.name == "C0000123pub.docx"
+    # Automation is disabled in tests (see conftest.isolated_paths), so a
+    # warning is expected, and the doc still needs to exist and be valid.
+    assert warning is not None
 
 
 def test_build_report_content_and_photo_grid(isolated_paths, tmp_path):
     photos = _make_photos(isolated_paths, tmp_path, count=3)
     data = report_builder.ReportRenderData(
         inputs=_build_sample_inputs(),
-        generated_text=_build_sample_text(),
+        body_text=_build_sample_text(),
         photos=photos,
-        page_count="2",
-        photo_page_count="1",
     )
 
-    output_path = report_builder.build_report(data)
+    output_path, _warning = report_builder.build_report(data)
     document = docx.Document(str(output_path))
 
     all_text = "\n".join(p.text for p in document.paragraphs)
@@ -87,31 +90,120 @@ def test_build_report_content_and_photo_grid(isolated_paths, tmp_path):
     assert "נמצא סדק בבסיס החלק" in all_text
     assert "הסדק נובע ככל הנראה מעייפות חומר" in all_text
 
+    # The report number must appear in the header, not a literal placeholder.
+    header_text = "\n".join(p.text for p in document.sections[0].header.paragraphs)
+    assert "C0000123" in header_text
+    assert "*מספר בדיקה*" not in header_text
+    assert "מספר בדיקה" not in header_text  # no leftover literal label either
+
+    # Word must silently recompute the header's PAGE/NUMPAGES fields the
+    # instant the file is opened, rather than showing whatever was cached
+    # the last time a human edited the canonical template.
+    update_fields = document.settings.element.find(qn("w:updateFields"))
+    assert update_fields is not None
+    assert update_fields.get(qn("w:val")) == "true"
+
     # The legal disclaimer table must survive untouched.
     disclaimer_texts = [t.rows[0].cells[0].text for t in document.tables if "התנאות" in t.rows[0].cells[0].text]
     assert disclaimer_texts, "legal disclaimer table missing or altered"
 
-    # The photo grid table: 3 photos, 2 columns -> 2 rows, with captions.
+    # The photo grid table: 3 photos, one group (capacity 4 by default) ->
+    # 2 photo rows + 1 merged caption row.
     photo_tables = [
         t for t in document.tables if any("תמונה 1" in c.text for row in t.rows for c in row.cells)
     ]
     assert photo_tables, "photo grid table not found"
     grid = photo_tables[0]
-    cell_texts = [c.text for row in grid.rows for c in row.cells]
-    assert any("תמונה 1: כיתוב לתמונה 1" in t for t in cell_texts)
-    assert any("תמונה 2: כיתוב לתמונה 2" in t for t in cell_texts)
-    assert any("תמונה 3: כיתוב לתמונה 3" in t for t in cell_texts)
+    assert len(grid.rows) == 3
+
+    # Bare, bold numbers directly beneath each photo (not full captions).
+    for n in ("1", "2", "3"):
+        assert any(
+            p.text.strip() == n for row in grid.rows[:2] for cell in row.cells for p in cell.paragraphs
+        ), f"photo number {n} not found beneath its photo"
+
+    # One aggregated, numbered caption block beneath the whole group.
+    caption_cell_text = grid.rows[2].cells[0].text
+    assert "תמונה 1:" in caption_cell_text
+    assert "1. כיתוב לתמונה 1" in caption_cell_text
+    assert "2. כיתוב לתמונה 2" in caption_cell_text
+    assert "3. כיתוב לתמונה 3" in caption_cell_text
+    heading_paragraph = grid.rows[2].cells[0].paragraphs[0]
+    heading_run = heading_paragraph.runs[0]
+    assert heading_run.bold is True
+    assert heading_run.underline is True
+
+    # Every row (photo rows + the merged caption row) must be non-splittable.
+    for row in grid.rows:
+        trPr = row._tr.find(qn("w:trPr"))
+        assert trPr is not None and trPr.find(qn("w:cantSplit")) is not None
+
+    # The first photo's own paragraph carries the forced page break and the
+    # appendix bookmark - no separate blank anchor paragraph exists.
+    first_image_paragraph = grid.rows[0].cells[0].paragraphs[0]
+    assert first_image_paragraph.paragraph_format.page_break_before is True
+    assert PHOTO_APPENDIX_BOOKMARK in _bookmark_names(document)
+
+    # Page-count automation is disabled in tests -> "-" placeholders, and a
+    # non-fatal warning explaining why.
+    case_info_table = document.tables[0]
+    pages_text = case_info_table.rows[1].cells[0].text
+    assert "עמודים" in pages_text and "-" in pages_text
+    assert "עמודי תמונות" in pages_text and "-" in pages_text
+
+
+def test_build_report_photo_grid_spans_multiple_pages(isolated_paths, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "PHOTOS_PER_APPENDIX_PAGE", 4)
+    photos = _make_photos(isolated_paths, tmp_path, count=6)
+    data = report_builder.ReportRenderData(
+        inputs=_build_sample_inputs(),
+        body_text=_build_sample_text(),
+        photos=photos,
+    )
+
+    output_path, _warning = report_builder.build_report(data)
+    document = docx.Document(str(output_path))
+
+    photo_tables = [
+        t for t in document.tables if any("תמונה 1" in c.text for row in t.rows for c in row.cells)
+    ]
+    assert photo_tables
+    grid = photo_tables[0]
+    # Group 1: 4 photos / 2 columns -> 2 photo rows + 1 caption row.
+    # Group 2: 2 photos / 2 columns -> 1 photo row + 1 caption row.
+    assert len(grid.rows) == 2 + 1 + 1 + 1
+
+    first_group_caption = grid.rows[2].cells[0].text
+    assert "תמונה 1:" in first_group_caption and "(המשך)" not in first_group_caption
+    assert "4. כיתוב לתמונה 4" in first_group_caption
+    assert "5. כיתוב לתמונה 5" not in first_group_caption
+
+    second_group_caption = grid.rows[4].cells[0].text
+    assert "תמונה 1: (המשך)" in second_group_caption
+    assert "5. כיתוב לתמונה 5" in second_group_caption
+    assert "6. כיתוב לתמונה 6" in second_group_caption
+
+    # The second group's first row also gets its own forced page break, so
+    # it can never end up sharing a page with the first group.
+    second_group_first_image_paragraph = grid.rows[3].cells[0].paragraphs[0]
+    assert second_group_first_image_paragraph.paragraph_format.page_break_before is True
+
+    for row in grid.rows:
+        trPr = row._tr.find(qn("w:trPr"))
+        assert trPr is not None and trPr.find(qn("w:cantSplit")) is not None
 
 
 def test_build_report_without_photos(isolated_paths):
     data = report_builder.ReportRenderData(
         inputs=_build_sample_inputs(),
-        generated_text=_build_sample_text(),
+        body_text=_build_sample_text(),
         photos=[],
     )
-    output_path = report_builder.build_report(data)
+    output_path, warning = report_builder.build_report(data)
     assert output_path.exists()
+    assert warning is not None  # automation disabled in tests
 
     document = docx.Document(str(output_path))
     marker_hits = [p for p in document.paragraphs if "PHOTOS_TABLE_MARKER" in p.text]
     assert not marker_hits, "marker paragraph should be removed even with zero photos"
+    assert PHOTO_APPENDIX_BOOKMARK not in _bookmark_names(document)
