@@ -1,0 +1,84 @@
+{
+  "reports": [
+    {
+      "report_id": "C2501508pub_ref1",
+      "category": "crane",
+      "source_report_path": "templates/crane_refernces/C2501508pub_ref1.docx",
+      "output_folder": "data/reference_examples/crane/C2501508pub_ref1",
+      "caption_extraction_status": "extracted_verbatim",
+      "photo_mapping_status": "needs_manual_photo_mapping",
+      "review_status": "pending_human_verification",
+      "caption_group_count": 3
+    },
+    {
+      "report_id": "C2502511pub_ref2",
+      "category": "crane",
+      "source_report_path": "templates/crane_refernces/C2502511pub_ref2.docx",
+      "output_folder": "data/reference_examples/crane/C2502511pub_ref2",
+      "caption_extraction_status": "extracted_verbatim",
+      "photo_mapping_status": "needs_manual_photo_mapping",
+      "review_status": "pending_human_verification",
+      "caption_group_count": 2
+    },
+    {
+      "report_id": "C2506545pub_ref3",
+      "category": "crane",
+      "source_report_path": "templates/crane_refernces/C2506545pub_ref3.docx",
+      "output_folder": "data/reference_examples/crane/C2506545pub_ref3",
+      "caption_extraction_status": "extracted_verbatim",
+      "photo_mapping_status": "needs_manual_photo_mapping",
+      "review_status": "pending_human_verification",
+      "caption_group_count": 3
+    },
+    {
+      "report_id": "C2409576pub_ref4",
+      "category": "chassis",
+      "source_report_path": "templates/chassis_references/C2409576pub_ref4.docx",
+      "output_folder": "data/reference_examples/chassis/C2409576pub_ref4",
+      "caption_extraction_status": "extracted_verbatim",
+      "photo_mapping_status": "needs_manual_photo_mapping",
+      "review_status": "pending_human_verification",
+      "caption_group_count": 4
+    },
+    {
+      "report_id": "C2604531pub_ref5",
+      "category": "chassis",
+      "source_report_path": "templates/chassis_references/C2604531pub_ref5.docx",
+      "output_folder": "data/reference_examples/chassis/C2604531pub_ref5",
+      "caption_extraction_status": "extracted_verbatim",
+      "photo_mapping_status": "needs_manual_photo_mapping",
+      "review_status": "pending_human_verification",
+      "caption_group_count": 2
+    },
+    {
+      "report_id": "C2606542pub_ref6",
+      "category": "chassis",
+      "source_report_path": "templates/chassis_references/C2606542pub_ref6.docx",
+      "output_folder": "data/reference_examples/chassis/C2606542pub_ref6",
+      "caption_extraction_status": "extracted_verbatim",
+      "photo_mapping_status": "needs_manual_photo_mapping",
+      "review_status": "pending_human_verification",
+      "caption_group_count": 2
+    },
+    {
+      "report_id": "C2303520pub_ref7",
+      "category": "actuator",
+      "source_report_path": "templates/actuator_refernces/C2303520pub_ref7.docx",
+      "output_folder": "data/reference_examples/actuator/C2303520pub_ref7",
+      "caption_extraction_status": "extracted_verbatim",
+      "photo_mapping_status": "needs_manual_photo_mapping",
+      "review_status": "pending_human_verification",
+      "caption_group_count": 2
+    },
+    {
+      "report_id": "C2403525pub_ref8",
+      "category": "actuator",
+      "source_report_path": "templates/actuator_refernces/C2403525pub_ref8.docx",
+      "output_folder": "data/reference_examples/actuator/C2403525pub_ref8",
+      "caption_extraction_status": "extracted_verbatim",
+      "photo_mapping_status": "needs_manual_photo_mapping",
+      "review_status": "pending_human_verification",
+      "caption_group_count": 2
+    }
+  ]
+}

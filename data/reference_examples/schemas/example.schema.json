@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "data/reference_examples/schemas/example.schema.json",
+  "title": "Reference caption example",
+  "description": "Shape of one report's captions.he.json file in the Hebrew industrial-photo captioning reference dataset.",
+  "type": "object",
+  "required": [
+    "report_id",
+    "category",
+    "source_report_path",
+    "caption_groups"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "report_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "crane",
+        "chassis",
+        "actuator"
+      ]
+    },
+    "source_report_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "caption_groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "group_id",
+          "photo_refs",
+          "approved_text_he",
+          "status",
+          "notes"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "photo_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Filenames of matched original photos, e.g. '1.1.jpg', '1.3-nameplate.jpg'. Empty until a human confirms the mapping to real image files."
+          },
+          "approved_text_he": {
+            "type": "string",
+            "description": "Exact original Hebrew wording. Never invented, summarized, or translated."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "needs_manual_photo_mapping",
+              "mapped",
+              "approved"
+            ]
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
