@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Generated files
+build/
+dist/
+reports/
+work/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Private raw reference inputs and generated pack
+data/approved_reference_pack/
+data/reference_examples/**/images/
+data/reference_examples/**/*_layout.pdf

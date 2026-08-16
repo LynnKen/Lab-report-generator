@@ -42,6 +42,7 @@ class PhotoAsset:
     order_index: int = 0
     approved_crop: bool = False
     crop_reviewed: bool = False
+    source_filename: str = ""
 
 
 def validate_photo_file(source_path: Path) -> None:
@@ -72,7 +73,7 @@ def validate_photo_file(source_path: Path) -> None:
         ) from exc
 
 
-def _open_corrected(path: Path) -> Image.Image:
+def open_corrected_image(path: Path) -> Image.Image:
     """Open an image with EXIF rotation applied, converted to RGB."""
     img = Image.open(path)
     img = ImageOps.exif_transpose(img)
@@ -118,6 +119,14 @@ def _heuristic_center_crop(img: Image.Image) -> BoundingBox:
     return (left, top, left + new_w, top + new_h)
 
 
+def image_size(path: Path) -> Tuple[int, int]:
+    """Returns the (width, height) in pixels of an image already written to
+    disk. Used by the report builder to size each photo by its real, final
+    aspect ratio (a cropped photo's shape differs from the original's)."""
+    with Image.open(path) as img:
+        return img.size
+
+
 def display_size_for(width: int, height: int, max_dimension: int) -> Tuple[int, int]:
     """Returns the on-screen size the (uncropped) photo is drawn at inside the
     crop dialog: scaled to fit `max_dimension` on its longest side, never
@@ -159,20 +168,8 @@ def render_uncropped_preview(asset: PhotoAsset, max_dimension: int) -> bytes:
     JPEG bytes. The crop dialog always frames the full original (never an
     already-cropped copy), which is what makes cropping non-destructive and
     lets Reset restore the whole image."""
-    img = _open_corrected(asset.original_path)
+    img = open_corrected_image(asset.original_path)
     preview_img = _resized_copy(img, max_dimension)
-    buffer = io.BytesIO()
-    preview_img.save(buffer, "JPEG", quality=config.PHOTO_JPEG_QUALITY)
-    return buffer.getvalue()
-
-
-def render_crop_preview(asset: PhotoAsset, crop_box: BoundingBox) -> bytes:
-    """Renders an in-memory JPEG preview of the ORIGINAL image cropped to
-    `crop_box`, without writing any files. Used by the manual crop dialog's
-    live preview before the user confirms and `apply_crop` is called."""
-    img = _open_corrected(asset.original_path)
-    cropped = img.crop(crop_box)
-    preview_img = _resized_copy(cropped, config.PHOTO_PREVIEW_MAX_DIMENSION_PX)
     buffer = io.BytesIO()
     preview_img.save(buffer, "JPEG", quality=config.PHOTO_JPEG_QUALITY)
     return buffer.getvalue()
@@ -189,7 +186,7 @@ def ingest_photo(source_path: Path, order_index: int = 0) -> PhotoAsset:
     original_dest = config.PHOTOS_ORIGINALS_DIR / f"{photo_id}{extension}"
     original_dest.write_bytes(source_path.read_bytes())
 
-    img = _open_corrected(original_dest)
+    img = open_corrected_image(original_dest)
     width, height = img.size
 
     preview_img = _resized_copy(img, config.PHOTO_PREVIEW_MAX_DIMENSION_PX)
@@ -211,13 +208,48 @@ def ingest_photo(source_path: Path, order_index: int = 0) -> PhotoAsset:
         height=height,
         suggested_crop_box=suggested_crop,
         order_index=order_index,
+        source_filename=source_path.name,
     )
+
+
+def renumber(photos: list[PhotoAsset]) -> None:
+    """Sets order_index to match each asset's position in the list. This is
+    the single place that decides what "final report order" means - the
+    report builder trusts order_index as source of truth, so every function
+    that changes photo order must end by calling this."""
+    for i, asset in enumerate(photos):
+        asset.order_index = i
+
+
+def move_photo(photos: list[PhotoAsset], from_index: int, to_index: int) -> None:
+    """Moves the photo at from_index to to_index in place (used by both drag
+    reorder and move-earlier/move-later buttons), then renumbers order_index
+    to match. The moved PhotoAsset keeps its caption/crop/metadata - only its
+    position (and therefore its displayed report number) changes."""
+    if from_index == to_index:
+        return
+    if not (0 <= from_index < len(photos)):
+        return
+    to_index = max(0, min(to_index, len(photos) - 1))
+    asset = photos.pop(from_index)
+    photos.insert(to_index, asset)
+    renumber(photos)
+
+
+def move_photo_earlier(photos: list[PhotoAsset], index: int) -> None:
+    if index > 0:
+        move_photo(photos, index, index - 1)
+
+
+def move_photo_later(photos: list[PhotoAsset], index: int) -> None:
+    if index < len(photos) - 1:
+        move_photo(photos, index, index + 1)
 
 
 def apply_crop(asset: PhotoAsset, crop_box: BoundingBox) -> PhotoAsset:
     """Regenerates the final (Word-ready) image using a user-approved crop box.
     Never called automatically — only in response to explicit user approval."""
-    img = _open_corrected(asset.original_path)
+    img = open_corrected_image(asset.original_path)
     left, top, right, bottom = crop_box
     left = max(0, min(left, img.width - 1))
     top = max(0, min(top, img.height - 1))
@@ -239,7 +271,7 @@ def apply_crop(asset: PhotoAsset, crop_box: BoundingBox) -> PhotoAsset:
 
 def discard_crop(asset: PhotoAsset) -> PhotoAsset:
     """Reverts to the uncropped, full-frame resized image."""
-    img = _open_corrected(asset.original_path)
+    img = open_corrected_image(asset.original_path)
 
     final_img = _resized_copy(img, config.PHOTO_MAX_DIMENSION_PX)
     final_img.save(asset.final_path, "JPEG", quality=config.PHOTO_JPEG_QUALITY)

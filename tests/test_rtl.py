@@ -81,10 +81,10 @@ def test_table_bidi_visual_is_in_schema_order(isolated_paths, tmp_path):
             assert tags.index("bidiVisual") < tags.index(later), tags
 
 
-def test_caption_number_marker_is_a_separate_ltr_run(isolated_paths, tmp_path):
-    """The "1." marker must live in its own left-to-right run. In a single RTL
-    run the bidi algorithm puts the period to the LEFT of the digit and the
-    reader sees ".1" - the exact bug reported from the generated report."""
+def test_caption_number_marker_run_is_rtl(isolated_paths, tmp_path):
+    """The "N." marker run must be right-to-left, which is what makes Word
+    place the period to the LEFT of the digit so the line renders ".1" - the
+    Hebrew numbered-list convention. An LTR marker run would render "1."."""
     photos = _make_photos(isolated_paths, tmp_path, count=2)
     data = report_builder.ReportRenderData(
         inputs=_build_sample_inputs(), body_text=_build_sample_text(), photos=photos
@@ -97,8 +97,8 @@ def test_caption_number_marker_is_a_separate_ltr_run(isolated_paths, tmp_path):
     assert len(line.runs) == 2, [r.text for r in line.runs]
 
     marker, text = line.runs
-    assert marker.text == "1."
-    assert marker.font.rtl is False, "marker run must be LTR so it renders as '1.' not '.1'"
+    assert marker.text == "1."  # logical order; Word renders the dot on the left
+    assert marker.font.rtl is True, "marker run must be RTL so it renders as '.1' not '1.'"
     assert text.text.startswith(" ")
     assert text.font.rtl is True
 

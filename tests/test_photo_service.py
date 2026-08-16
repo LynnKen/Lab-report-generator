@@ -92,19 +92,6 @@ def test_discard_crop_reverts_to_full_frame(isolated_paths, sample_image_path):
     assert reverted.crop_reviewed is True
 
 
-def test_render_crop_preview_returns_jpeg_bytes(isolated_paths, sample_image_path):
-    asset = photo_service.ingest_photo(sample_image_path, order_index=0)
-    original_final_bytes = asset.final_path.read_bytes()
-
-    preview_bytes = photo_service.render_crop_preview(asset, (10, 10, 500, 400))
-
-    assert preview_bytes.startswith(b"\xff\xd8")  # JPEG magic bytes
-    # Rendering a preview must not touch the saved final/preview files or
-    # mark the crop as approved - it's purely an in-memory preview.
-    assert asset.final_path.read_bytes() == original_final_bytes
-    assert asset.approved_crop is False
-
-
 def test_caption_provenance_tracks_manual_edits(isolated_paths, sample_image_path):
     asset = photo_service.ingest_photo(sample_image_path, order_index=0)
     assert asset.caption_is_manual is False
@@ -199,3 +186,59 @@ def test_crop_is_recut_from_the_original_not_the_previous_crop(isolated_paths, s
         assert restored.width / restored.height == original.width / original.height
     assert asset.user_crop_box is None
     assert asset.approved_crop is False
+
+
+def test_ingest_photo_captures_source_filename(isolated_paths, sample_image_path):
+    asset = photo_service.ingest_photo(sample_image_path, order_index=0)
+
+    # The file gets copied under a generated photo_id, so the human-readable
+    # original filename must be captured separately - it's otherwise lost.
+    assert asset.source_filename == sample_image_path.name
+    assert asset.original_path.name != sample_image_path.name
+
+
+def _make_asset(isolated_paths, tmp_path, name: str, index: int) -> photo_service.PhotoAsset:
+    src = tmp_path / name
+    Image.new("RGB", (40, 30), (index * 10, 0, 0)).save(src, "JPEG")
+    asset = photo_service.ingest_photo(src, order_index=index)
+    asset.caption = f"caption-{index}"
+    return asset
+
+
+def test_move_photo_updates_order_and_keeps_caption_attached(isolated_paths, tmp_path):
+    photos = [_make_asset(isolated_paths, tmp_path, f"p{i}.jpg", i) for i in range(3)]
+    ids = [p.photo_id for p in photos]
+
+    photo_service.move_photo(photos, 0, 2)  # move the first photo to last
+
+    assert [p.photo_id for p in photos] == [ids[1], ids[2], ids[0]]
+    assert [p.order_index for p in photos] == [0, 1, 2]
+    # The moved asset kept its own caption - only its position changed.
+    moved = next(p for p in photos if p.photo_id == ids[0])
+    assert moved.caption == "caption-0"
+
+
+def test_move_photo_earlier_and_later_respect_boundaries(isolated_paths, tmp_path):
+    photos = [_make_asset(isolated_paths, tmp_path, f"p{i}.jpg", i) for i in range(3)]
+    ids = [p.photo_id for p in photos]
+
+    photo_service.move_photo_earlier(photos, 0)  # already first - no-op
+    assert [p.photo_id for p in photos] == ids
+
+    photo_service.move_photo_later(photos, 2)  # already last - no-op
+    assert [p.photo_id for p in photos] == ids
+
+    photo_service.move_photo_later(photos, 0)
+    assert [p.photo_id for p in photos] == [ids[1], ids[0], ids[2]]
+    assert [p.order_index for p in photos] == [0, 1, 2]
+
+    photo_service.move_photo_earlier(photos, 2)
+    assert [p.photo_id for p in photos] == [ids[1], ids[2], ids[0]]
+    assert [p.order_index for p in photos] == [0, 1, 2]
+
+
+def test_renumber_matches_list_position(isolated_paths, tmp_path):
+    photos = [_make_asset(isolated_paths, tmp_path, f"p{i}.jpg", i) for i in range(3)]
+    photos.reverse()  # simulate a removal/reorder that left order_index stale
+    photo_service.renumber(photos)
+    assert [p.order_index for p in photos] == [0, 1, 2]

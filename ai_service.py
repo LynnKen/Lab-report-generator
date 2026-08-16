@@ -22,6 +22,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+import approved_reference_service
 import config
 
 
@@ -61,6 +62,70 @@ def _load_text(path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _reference_mode() -> str:
+    """The effective mode: "text" | "visual" | "off". APPROVED_REFERENCES_ENABLED
+    is the master switch (kept for backward compatibility); APPROVED_REFERENCE_MODE
+    picks the flavor when enabled. Either one set to "disable" wins."""
+    if not config.APPROVED_REFERENCES_ENABLED:
+        return "off"
+    mode = config.APPROVED_REFERENCE_MODE
+    return mode if mode in ("text", "visual") else "off"
+
+
+def _build_approved_reference_context_he() -> str:
+    """Best-effort only - a problem reading/scanning the approved dataset
+    (dev live tree or production pack, see approved_reference_service.py)
+    must never block photo captioning. Returns "" on any failure, or when
+    the feature is disabled."""
+    mode = _reference_mode()
+    if mode == "off":
+        return ""
+    try:
+        if mode == "visual":
+            _visual_examples, text_context = approved_reference_service.build_visual_reference_payload()
+            return text_context
+        selection = approved_reference_service.select_reference_examples()
+        return approved_reference_service.build_reference_context_he(selection)
+    except Exception:
+        return ""
+
+
+_REFERENCE_IMAGES_INTRO_HE = (
+    "להלן דוגמאות תמונה מאושרות מדוחות קודמים, כל אחת עם הכיתוב המאושר שלה - "
+    "לצורך למידת סגנון וניסוח בלבד. אלו אינן עדות לגבי התמונה החדשה: אין "
+    "להעתיק מהן פרט טכני, נזק, מדידה, מנגנון כשל, סיבה או מסקנה."
+)
+_REFERENCE_IMAGE_CAPTION_PREFIX_HE = "כיתוב מאושר לדוגמה זו: "
+_TARGET_IMAGE_INTRO_HE = (
+    "זוהי התמונה החדשה שיש לכתוב עבורה כיתוב - היא היחידה שיש להתייחס אליה "
+    "בפועל בתשובה. הדוגמאות שלמעלה הן רקע סגנוני בלבד ואינן קובעות מה מוצג כאן."
+)
+
+
+def _build_visual_reference_examples() -> list[tuple[bytes, str, str]]:
+    """Best-effort, bounded list of (image_bytes, media_type, approved_caption)
+    for APPROVED_REFERENCE_MODE=visual - only ever built from single-image
+    approved blocks (see approved_reference_service.build_visual_reference_payload),
+    so a multi-image group caption can never be sent as one image's label.
+    Returns [] on any failure or when visual mode isn't active."""
+    if _reference_mode() != "visual":
+        return []
+    try:
+        visual_blocks, _text = approved_reference_service.build_visual_reference_payload()
+        examples: list[tuple[bytes, str, str]] = []
+        for block in visual_blocks:
+            if not block.image_instances:
+                continue
+            data = block.image_instances[0].load_preview_bytes(
+                config.APPROVED_REFERENCE_PREVIEW_MAX_DIMENSION_PX
+            )
+            if data:
+                examples.append((data, "image/jpeg", block.approved_text_he))
+        return examples
+    except Exception:
+        return []
+
+
 def build_caption_prompt() -> tuple[str, str]:
     """Builds (system_prompt, user_message) for a photo-captioning call."""
     style_guide = _load_text(config.STYLE_GUIDE_PATH)
@@ -68,6 +133,14 @@ def build_caption_prompt() -> tuple[str, str]:
 
     system_prompt = template_text or _DEFAULT_PROMPT
     system_prompt = system_prompt.replace("{{style_guide}}", style_guide or "(אין מדריך סגנון זמין)")
+
+    reference_context = _build_approved_reference_context_he()
+    if "{{approved_reference_context}}" in system_prompt:
+        system_prompt = system_prompt.replace("{{approved_reference_context}}", reference_context)
+    elif reference_context:
+        # Custom prompt files written before this feature existed have no
+        # placeholder to substitute - append instead of silently dropping it.
+        system_prompt = f"{system_prompt}\n\n{reference_context}"
 
     user_message = (
         "כתוב כיתוב קצר אחד בעברית לתמונה המצורפת, בהתאם לחוקים שהוגדרו. "
@@ -89,6 +162,8 @@ _DEFAULT_PROMPT = """\
    מסקנה על סמך התמונה - אלו שייכים אך ורק למשתמש בפרקי "ממצאים" ו"דיון ומסקנות".
 3. אם אינך בטוח מה מוצג בתמונה, כתוב תיאור כללי וזהיר בלבד, ולעולם אל תנחש פרטים טכניים.
 4. החזר אך ורק JSON תקני התואם את הסכימה שסופקה, ללא טקסט נוסף.
+
+{{approved_reference_context}}
 """
 
 
@@ -130,11 +205,14 @@ class _RetryingAIService(AIService):
         system_prompt, user_message = build_caption_prompt()
         image_bytes = image_path.read_bytes()
         media_type = "image/jpeg"  # photo_service always saves final/cropped images as JPEG
+        reference_images = _build_visual_reference_examples()
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                raw_json = self._call_model(system_prompt, user_message, image_bytes, media_type)
+                raw_json = self._call_model(
+                    system_prompt, user_message, image_bytes, media_type, reference_images
+                )
                 return self._parse_response(raw_json).caption.strip()
             except (AIServiceError, ValidationError, json.JSONDecodeError) as exc:
                 last_error = exc
@@ -147,7 +225,14 @@ class _RetryingAIService(AIService):
             f"{self.provider_name} provider failed after {self.max_retries + 1} attempt(s): {last_error}"
         ) from last_error
 
-    def _call_model(self, system_prompt: str, user_message: str, image_bytes: bytes, media_type: str) -> str:
+    def _call_model(
+        self,
+        system_prompt: str,
+        user_message: str,
+        image_bytes: bytes,
+        media_type: str,
+        reference_images: list[tuple[bytes, str, str]] = (),
+    ) -> str:
         raise NotImplementedError
 
     @staticmethod
@@ -171,28 +256,48 @@ class AnthropicAIService(_RetryingAIService):
 
         self._client = anthropic.Anthropic(api_key=api_key, timeout=timeout)
 
-    def _call_model(self, system_prompt: str, user_message: str, image_bytes: bytes, media_type: str) -> str:
+    def _call_model(
+        self,
+        system_prompt: str,
+        user_message: str,
+        image_bytes: bytes,
+        media_type: str,
+        reference_images: list[tuple[bytes, str, str]] = (),
+    ) -> str:
         tool_name = "submit_photo_caption"
+        content: list[dict] = []
+        if reference_images:
+            content.append({"type": "text", "text": _REFERENCE_IMAGES_INTRO_HE})
+            for ref_bytes, ref_media_type, ref_caption in reference_images:
+                content.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": ref_media_type,
+                            "data": base64.b64encode(ref_bytes).decode("ascii"),
+                        },
+                    }
+                )
+                content.append({"type": "text", "text": f'{_REFERENCE_IMAGE_CAPTION_PREFIX_HE}"{ref_caption}"'})
+            content.append({"type": "text", "text": _TARGET_IMAGE_INTRO_HE})
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                },
+            }
+        )
+        content.append({"type": "text", "text": user_message})
+
         response = self._client.messages.create(
             model=self.model or "claude-sonnet-4-5",
             max_tokens=1024,
             system=system_prompt,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": base64.b64encode(image_bytes).decode("ascii"),
-                            },
-                        },
-                        {"type": "text", "text": user_message},
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
             tools=[
                 {
                     "name": tool_name,
@@ -217,19 +322,34 @@ class OpenAIAIService(_RetryingAIService):
 
         self._client = openai.OpenAI(api_key=api_key, timeout=timeout)
 
-    def _call_model(self, system_prompt: str, user_message: str, image_bytes: bytes, media_type: str) -> str:
+    def _call_model(
+        self,
+        system_prompt: str,
+        user_message: str,
+        image_bytes: bytes,
+        media_type: str,
+        reference_images: list[tuple[bytes, str, str]] = (),
+    ) -> str:
+        message_content: list[dict] = []
+        if reference_images:
+            message_content.append({"type": "text", "text": _REFERENCE_IMAGES_INTRO_HE})
+            for ref_bytes, ref_media_type, ref_caption in reference_images:
+                ref_data_url = f"data:{ref_media_type};base64,{base64.b64encode(ref_bytes).decode('ascii')}"
+                message_content.append({"type": "image_url", "image_url": {"url": ref_data_url}})
+                message_content.append(
+                    {"type": "text", "text": f'{_REFERENCE_IMAGE_CAPTION_PREFIX_HE}"{ref_caption}"'}
+                )
+            message_content.append({"type": "text", "text": _TARGET_IMAGE_INTRO_HE})
+
         data_url = f"data:{media_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        message_content.append({"type": "text", "text": user_message})
+        message_content.append({"type": "image_url", "image_url": {"url": data_url}})
+
         response = self._client.chat.completions.create(
             model=self.model or "gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_message},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                },
+                {"role": "user", "content": message_content},
             ],
             response_format={
                 "type": "json_schema",
@@ -240,10 +360,10 @@ class OpenAIAIService(_RetryingAIService):
                 },
             },
         )
-        content = response.choices[0].message.content
-        if not content:
+        result_content = response.choices[0].message.content
+        if not result_content:
             raise AIServiceError("OpenAI response had no content")
-        return content
+        return result_content
 
 
 _PROVIDERS = {

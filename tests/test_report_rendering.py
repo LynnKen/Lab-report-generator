@@ -193,6 +193,46 @@ def test_build_report_photo_grid_spans_multiple_pages(isolated_paths, tmp_path, 
         assert trPr is not None and trPr.find(qn("w:cantSplit")) is not None
 
 
+def test_build_report_uses_order_index_not_list_position(isolated_paths, tmp_path):
+    """The report photo order is a manual reviewer decision (order_index),
+    never derived from insertion order, filename, or upload time - so a
+    photos list that is NOT already sorted must still render in order_index
+    order."""
+    from PIL import Image
+
+    def make(name: str, order_index: int, caption: str) -> photo_service.PhotoAsset:
+        src = tmp_path / name
+        Image.new("RGB", (800, 600), (10, 50, 200)).save(src, "JPEG")
+        asset = photo_service.ingest_photo(src, order_index=order_index)
+        asset.caption = caption
+        return asset
+
+    # Appended in one order, but assigned to different final positions -
+    # exactly what happens after a reviewer drags/moves a photo.
+    photo_a = make("a.jpg", order_index=2, caption="כיתוב א")
+    photo_b = make("b.jpg", order_index=0, caption="כיתוב ב")
+    photo_c = make("c.jpg", order_index=1, caption="כיתוב ג")
+    photos = [photo_a, photo_b, photo_c]
+
+    data = report_builder.ReportRenderData(
+        inputs=_build_sample_inputs(),
+        body_text=_build_sample_text(),
+        photos=photos,
+    )
+
+    output_path, _warning = report_builder.build_report(data)
+    document = docx.Document(str(output_path))
+
+    photo_tables = [
+        t for t in document.tables if any("תמונה 1" in c.text for row in t.rows for c in row.cells)
+    ]
+    caption_text = photo_tables[0].rows[2].cells[0].text
+
+    assert "1. כיתוב ב" in caption_text  # order_index=0
+    assert "2. כיתוב ג" in caption_text  # order_index=1
+    assert "3. כיתוב א" in caption_text  # order_index=2
+
+
 def test_build_report_without_photos(isolated_paths):
     data = report_builder.ReportRenderData(
         inputs=_build_sample_inputs(),
@@ -207,3 +247,127 @@ def test_build_report_without_photos(isolated_paths):
     marker_hits = [p for p in document.paragraphs if "PHOTOS_TABLE_MARKER" in p.text]
     assert not marker_hits, "marker paragraph should be removed even with zero photos"
     assert PHOTO_APPENDIX_BOOKMARK not in _bookmark_names(document)
+
+
+# --- photo-appendix vertical budget ----------------------------------------
+# python-docx cannot paginate, so a group of photos plus its caption block is
+# made to fit one page by construction. Portrait photos are ~1.8x taller than
+# landscape ones at the same column width; before the height budget existed
+# they overflowed the page and orphaned the caption block onto a page of its
+# own. Assert the geometry invariant directly rather than needing Word.
+
+_EMU_PER_INCH = 914400
+
+
+def _make_photos_sized(tmp_path, size, count, prefix="p"):
+    from PIL import Image
+
+    photos = []
+    for i in range(count):
+        src = tmp_path / f"{prefix}_{i}.jpg"
+        Image.new("RGB", size, (10 * i, 60, 180)).save(src, "JPEG")
+        asset = photo_service.ingest_photo(src, order_index=i)
+        asset.caption = f"כיתוב לתמונה {i + 1}"
+        photos.append(asset)
+    return photos
+
+
+def _picture_sizes_inches(document):
+    sizes = []
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    for extent in paragraph._p.iter(qn("wp:extent")):
+                        sizes.append(
+                            (int(extent.get("cx")) / _EMU_PER_INCH, int(extent.get("cy")) / _EMU_PER_INCH)
+                        )
+    return sizes
+
+
+def _build_with(photos):
+    return report_builder.build_report(
+        report_builder.ReportRenderData(
+            inputs=_build_sample_inputs(), body_text=_build_sample_text(), photos=photos
+        )
+    )
+
+
+def _budget(document):
+    columns = config.PHOTO_GRID_COLUMNS
+    gutter_in = (config.PHOTO_GUTTER_MM / 2 * 2) / 25.4
+    return report_builder._photo_area_budget(
+        document, config.PHOTOS_PER_APPENDIX_PAGE, columns, gutter_in
+    ), gutter_in
+
+
+def test_portrait_photos_are_capped_to_the_height_budget(isolated_paths, tmp_path):
+    photos = _make_photos_sized(tmp_path, (1200, 1600), config.PHOTOS_PER_APPENDIX_PAGE)
+    output_path, _ = _build_with(photos)
+    document = docx.Document(str(output_path))
+
+    max_height_in, _gutter = _budget(document)
+    sizes = _picture_sizes_inches(document)
+    assert len(sizes) == config.PHOTOS_PER_APPENDIX_PAGE
+
+    for width_in, height_in in sizes:
+        assert height_in <= max_height_in + 1e-6, (height_in, max_height_in)
+        # aspect ratio preserved - never stretched or re-cropped
+        assert abs((height_in / width_in) - (1600 / 1200)) < 0.01
+
+
+def test_a_full_portrait_page_plus_its_caption_block_fits_one_page(isolated_paths, tmp_path):
+    """The regression that orphaned the caption: a full group of portrait
+    photos plus the caption block must not exceed the usable page height."""
+    photos = _make_photos_sized(tmp_path, (1200, 1600), config.PHOTOS_PER_APPENDIX_PAGE)
+    output_path, _ = _build_with(photos)
+    document = docx.Document(str(output_path))
+
+    max_h, gutter_in = _budget(document)
+    columns = config.PHOTO_GRID_COLUMNS
+    capacity = config.PHOTOS_PER_APPENDIX_PAGE
+    rows = -(-capacity // columns)
+
+    tallest = max(h for _w, h in _picture_sizes_inches(document))
+    per_row = tallest + report_builder._PHOTO_NUMBER_LINE_IN + gutter_in
+    caption_block = (
+        1 + capacity * report_builder._CAPTION_LINES_PER_PHOTO
+    ) * report_builder._CAPTION_LINE_HEIGHT_IN + gutter_in
+
+    total = rows * per_row + caption_block
+    assert total <= report_builder._usable_height_inches(document), total
+
+
+def test_landscape_photos_stay_width_limited(isolated_paths, tmp_path):
+    """The height budget must not shrink photos that already fit - landscape
+    images keep filling the full column width as before."""
+    photos = _make_photos_sized(tmp_path, (1600, 1200), 2)
+    output_path, _ = _build_with(photos)
+    document = docx.Document(str(output_path))
+
+    columns = config.PHOTO_GRID_COLUMNS
+    gutter_in = (config.PHOTO_GUTTER_MM / 2 * 2) / 25.4
+    expected_width = max(
+        0.5,
+        (report_builder._usable_width_inches(document) / columns - gutter_in)
+        * config.PHOTO_IMAGE_SCALE,
+    )
+    for width_in, _height_in in _picture_sizes_inches(document):
+        assert abs(width_in - expected_width) < 0.01, (width_in, expected_width)
+
+
+def test_mixed_orientations_each_respect_their_own_aspect(isolated_paths, tmp_path):
+    portrait = _make_photos_sized(tmp_path, (1200, 1600), 2, prefix="tall")
+    landscape = _make_photos_sized(tmp_path, (1600, 1200), 2, prefix="wide")
+    photos = [portrait[0], landscape[0], portrait[1], landscape[1]]
+    for i, a in enumerate(photos):
+        a.order_index = i
+
+    output_path, _ = _build_with(photos)
+    document = docx.Document(str(output_path))
+
+    max_height_in, _gutter = _budget(document)
+    ratios = sorted(round(h / w, 2) for w, h in _picture_sizes_inches(document))
+    assert ratios == [0.75, 0.75, 1.33, 1.33], ratios
+    for _w, h in _picture_sizes_inches(document):
+        assert h <= max_height_in + 1e-6

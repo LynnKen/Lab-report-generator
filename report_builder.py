@@ -29,6 +29,7 @@ from docxtpl import DocxTemplate
 from pydantic import BaseModel, ConfigDict, Field
 
 import config
+import photo_service
 import template_prep
 import word_page_counter
 from photo_service import PhotoAsset
@@ -206,6 +207,49 @@ def _usable_width_inches(document: docx.Document) -> float:
     return usable_emu / 914400  # EMUs per inch
 
 
+def _usable_height_inches(document: docx.Document) -> float:
+    section = document.sections[0]
+    usable_emu = section.page_height - section.top_margin - section.bottom_margin
+    return usable_emu / 914400
+
+
+# Vertical budget estimates for the photo appendix (inches). python-docx
+# cannot lay text out, so a page's photos + caption block are made to fit by
+# construction: each photo is capped to a height that leaves room for its
+# number and for the caption block beneath the group. Without this a portrait
+# photo (h/w ~1.33) is ~1.8x taller than a landscape one at the same column
+# width, which overflowed the page and pushed the caption block onto a page of
+# its own.
+_CAPTION_LINE_HEIGHT_IN = 0.18
+_CAPTION_LINES_PER_PHOTO = 1.4  # headroom for a caption that wraps to 2 lines
+_PHOTO_NUMBER_LINE_IN = 0.22  # the large bold number under each photo
+_PAGE_SAFETY_MARGIN_IN = 0.30  # slack for the header block growing the top margin
+
+
+def _photo_area_budget(document: docx.Document, capacity: int, columns: int, gutter_in: float) -> float:
+    """Max height (inches) any single photo may occupy, so that a full group
+    of `capacity` photos plus its caption block still fits on one page."""
+    rows_per_page = math.ceil(capacity / columns)
+    caption_block_in = (
+        1 + capacity * _CAPTION_LINES_PER_PHOTO
+    ) * _CAPTION_LINE_HEIGHT_IN + gutter_in
+    available_in = _usable_height_inches(document) - caption_block_in - _PAGE_SAFETY_MARGIN_IN
+    row_budget_in = available_in / max(1, rows_per_page)
+    return max(0.75, row_budget_in - _PHOTO_NUMBER_LINE_IN - gutter_in)
+
+
+def _photo_width_inches(photo: PhotoAsset, max_width_in: float, max_height_in: float) -> float:
+    """Width to insert a photo at so it fits BOTH the column width and the
+    per-photo height budget, preserving its real aspect ratio (never cropping
+    or stretching). Landscape photos stay width-limited exactly as before;
+    only tall photos get scaled down further."""
+    width_px, height_px = photo_service.image_size(photo.final_path)
+    if height_px <= 0:
+        return max_width_in
+    width_at_max_height = max_height_in * (width_px / height_px)
+    return max(0.5, min(max_width_in, width_at_max_height))
+
+
 def _merge_row_into_one_cell(row):
     """Merges every cell in a table row into a single wide cell (used for
     the borderless caption block spanning the full row width)."""
@@ -250,22 +294,21 @@ def _set_run_size_both(run, size) -> None:
 
 
 def _add_numbered_caption_line(cell, number: int, caption: str):
-    """Adds one "N. caption" line as TWO runs: a left-to-right run holding the
-    "N." marker, then a right-to-left run holding the Hebrew text.
+    """Adds one "N. caption" line as TWO runs: the "N." marker, then the
+    Hebrew text. Both runs are right-to-left.
 
-    Splitting the runs is what keeps the marker readable. In a single RTL run
-    the Unicode bidi algorithm resolves the '.' after a digit to the
-    paragraph's own (right-to-left) direction, so "1." is laid out with the
-    period to the LEFT of the digit and the reader sees ".1". Marking just the
-    marker run as LTR keeps "1." together and in the right order, while the
-    paragraph as a whole still starts at the right margin. Verified against a
-    real Word render, not assumed."""
+    Marking the marker run RTL is what puts the period on the LEFT of the
+    digit, so the line renders ".1" - the Hebrew convention for a numbered
+    list, where the terminating punctuation falls on the reading-end side.
+    (An LTR marker run would instead render the English-looking "1.".) The
+    source string stays the natural "1." and Word's bidi resolution places
+    the period; verified against a real Word render, not assumed."""
     paragraph = cell.add_paragraph()
     _set_paragraph_bidi(paragraph)
     _align_to_rtl_start(paragraph)
 
     marker_run = paragraph.add_run(f"{number}.")
-    marker_run.font.rtl = False
+    marker_run.font.rtl = True
 
     if caption:
         text_run = paragraph.add_run(f" {caption}")
@@ -328,6 +371,7 @@ def _insert_photo_grid(document: docx.Document, photos: List[PhotoAsset]) -> Opt
     gutter_in = (cell_margin_mm * 2) / 25.4
     column_width_in = _usable_width_inches(document) / columns
     image_width_in = max(0.5, (column_width_in - gutter_in) * config.PHOTO_IMAGE_SCALE)
+    image_max_height_in = _photo_area_budget(document, capacity, columns, gutter_in)
 
     groups = [photos[i : i + capacity] for i in range(0, len(photos), capacity)]
     total_photo_rows = sum(math.ceil(len(group) / columns) for group in groups)
@@ -348,7 +392,8 @@ def _insert_photo_grid(document: docx.Document, photos: List[PhotoAsset]) -> Opt
 
             image_paragraph = cell.paragraphs[0]
             image_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            image_paragraph.add_run().add_picture(str(photo.final_path), width=Inches(image_width_in))
+            width_in = _photo_width_inches(photo, image_width_in, image_max_height_in)
+            image_paragraph.add_run().add_picture(str(photo.final_path), width=Inches(width_in))
 
             _add_photo_number(cell, photo_number)
             photo_number += 1

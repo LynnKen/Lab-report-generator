@@ -12,60 +12,163 @@
   ],
   "additionalProperties": false,
   "properties": {
-    "report_id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "category": {
-      "type": "string",
-      "enum": [
-        "crane",
-        "chassis",
-        "actuator"
-      ]
-    },
-    "source_report_path": {
-      "type": "string",
-      "minLength": 1
-    },
+    "report_id": { "type": "string", "minLength": 1 },
+    "category": { "type": "string", "enum": ["crane", "chassis", "actuator"] },
+    "source_report_path": { "type": "string", "minLength": 1 },
     "caption_groups": {
       "type": "array",
       "items": {
         "type": "object",
         "required": [
           "group_id",
-          "photo_refs",
-          "approved_text_he",
-          "status",
-          "notes"
+          "original_text_he",
+          "notes",
+          "source_blocks",
+          "legacy_unmapped_images",
+          "legacy_group_review"
         ],
         "additionalProperties": false,
         "properties": {
-          "group_id": {
+          "group_id": { "type": "string", "minLength": 1 },
+          "original_text_he": {
             "type": "string",
-            "minLength": 1
+            "description": "Exact original Hebrew wording for the whole group, verbatim from the source DOCX. Immutable - never written to by the review screen. Editing happens only on each source_blocks entry's own approved_text_he."
           },
-          "photo_refs": {
+          "notes": { "type": "string" },
+          "legacy_unmapped_images": {
             "type": "array",
+            "items": { "type": "string" },
+            "description": "Filenames selected under an earlier, group-level-only mapping model, before source_blocks existed. Kept so no prior work is lost; never redistributed automatically - a human must re-assign each one to the correct block."
+          },
+          "legacy_group_review": {
+            "type": "object",
+            "description": "Historical record of the group-level review workflow used before per-block approval existed (reviewed_at/reviewer_name/audit_log). Read-only, kept for audit purposes only.",
+            "required": ["reviewed_at", "reviewer_name", "audit_log"],
+            "additionalProperties": false,
+            "properties": {
+              "reviewed_at": { "type": ["string", "null"] },
+              "reviewer_name": { "type": ["string", "null"] },
+              "audit_log": { "type": "array", "items": { "type": "object" } }
+            }
+          },
+          "source_blocks": {
+            "type": "array",
+            "description": "Read-only-labeled, per-photo-number review units. Each maps its own text and images independently of the others.",
             "items": {
-              "type": "string"
-            },
-            "description": "Filenames of matched original photos, e.g. '1.1.jpg', '1.3-nameplate.jpg'. Empty until a human confirms the mapping to real image files."
-          },
-          "approved_text_he": {
-            "type": "string",
-            "description": "Exact original Hebrew wording. Never invented, summarized, or translated."
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "needs_manual_photo_mapping",
-              "mapped",
-              "approved"
-            ]
-          },
-          "notes": {
-            "type": "string"
+              "type": "object",
+              "required": [
+                "block_id",
+                "document_photo_label",
+                "document_photo_refs",
+                "original_text_he",
+                "approved_text_he",
+                "image_instances",
+                "status",
+                "extraction_confidence",
+                "ambiguity_notes",
+                "layout_evidence",
+                "cannot_determine_reason",
+                "review"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "block_id": { "type": "string", "minLength": 1, "description": "Stable ASCII id, e.g. '1.1-1.3' or '1.4'." },
+                "document_photo_label": { "type": "string", "description": "Display label, e.g. '1.1–1.3'." },
+                "document_photo_refs": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "The document's own photo numbers this block covers, e.g. ['1.1','1.2','1.3']. Never the same thing as an image instance's source_file - kept as separate concepts."
+                },
+                "original_text_he": {
+                  "type": "string",
+                  "description": "Exact source wording for this block. Immutable - never edited by the review screen."
+                },
+                "approved_text_he": {
+                  "type": "string",
+                  "description": "Editable, human-reviewed wording for this block. Starts identical to original_text_he."
+                },
+                "image_instances": {
+                  "type": "array",
+                  "description": "The images that back this block, in display order. The SAME source_file may appear in several instances (in this block, or in other blocks) - a source photo is not exclusive to one block. A 'crop' instance never modifies the original file; it stores only a normalized rectangle interpreted at render time.",
+                  "items": {
+                    "type": "object",
+                    "required": ["instance_id", "source_file", "variant_type", "crop", "display_order", "preview_path"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "instance_id": { "type": "string", "minLength": 1 },
+                      "source_file": { "type": "string", "minLength": 1, "description": "Filename under this report's images/ folder. Never modified by crop/instance operations." },
+                      "variant_type": { "type": "string", "enum": ["full", "crop"] },
+                      "crop": {
+                        "anyOf": [
+                          {
+                            "type": "object",
+                            "required": ["left", "top", "width", "height"],
+                            "additionalProperties": false,
+                            "properties": {
+                              "left": { "type": "number", "minimum": 0, "maximum": 1 },
+                              "top": { "type": "number", "minimum": 0, "maximum": 1 },
+                              "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+                              "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+                            }
+                          },
+                          { "type": "null" }
+                        ],
+                        "description": "Normalized (0.0-1.0) crop rectangle relative to the orientation-corrected source image. Null for variant_type 'full'."
+                      },
+                      "display_order": { "type": "integer", "minimum": 0 },
+                      "preview_path": {
+                        "type": ["string", "null"],
+                        "description": "Optional locally generated cache path for a pre-rendered preview. Never the source image itself, and never required - the UI can always re-render from source_file + crop."
+                      }
+                    }
+                  }
+                },
+                "status": {
+                  "type": "string",
+                  "enum": ["not_reviewed", "approved", "needs_edit", "cannot_determine"],
+                  "description": "Never set to 'approved' automatically."
+                },
+                "extraction_confidence": {
+                  "type": "string",
+                  "enum": ["human_annotated", "numbers_confirmed_text_unsplit", "uncertain"],
+                  "description": "human_annotated: a reviewer already split this block by hand. numbers_confirmed_text_unsplit: document_photo_refs verified against the DOCX/layout PDF, but the text has not been split per number yet. uncertain: no reliable number evidence found."
+                },
+                "ambiguity_notes": {
+                  "type": "string",
+                  "description": "Free text explaining any uncertainty in this block's number-to-text mapping. Empty when there is none."
+                },
+                "layout_evidence": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "required": ["pdf_filename", "page_number"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "pdf_filename": { "type": "string" },
+                        "page_number": { "type": "integer", "minimum": 1 }
+                      }
+                    },
+                    { "type": "null" }
+                  ],
+                  "description": "Which layout PDF and 1-indexed page number visually confirms this block's photo numbers, or null if not determinable."
+                },
+                "cannot_determine_reason": {
+                  "type": ["string", "null"],
+                  "enum": ["missing_source_image", "mapping_ambiguous", "source_image_unreadable", "other", null],
+                  "description": "Structured reason recorded when status is 'cannot_determine'. Null otherwise, and cleared automatically the moment an image is assigned again."
+                },
+                "review": {
+                  "type": "object",
+                  "required": ["reviewed_at", "reviewer_name", "audit_log"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "reviewed_at": { "type": ["string", "null"] },
+                    "reviewer_name": { "type": ["string", "null"] },
+                    "audit_log": { "type": "array", "items": { "type": "object" } }
+                  }
+                }
+              }
+            }
           }
         }
       }
